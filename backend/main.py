@@ -1,0 +1,482 @@
+"""
+Windows fix: uvicorn's --reload supervisor can leave the child process on
+asyncio's SelectorEventLoop instead of ProactorEventLoop. Selector loops
+cannot spawn subprocesses on Windows at all (raises NotImplementedError),
+and the Agent SDK spawns the `claude` CLI as a subprocess -- so without
+this, every connection fails with CLIConnectionError. Must run before
+anything else touches the event loop.
+"""
+import sys
+
+if sys.platform == "win32":
+    import asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+import asyncio
+import base64
+import json
+import logging
+import re
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from . import automations, config, media, push, tts
+from .agent import new_client, wrap_for_voice
+from .events import bus
+
+logger = logging.getLogger("neural.main")
+
+app = FastAPI(title="Neural")
+
+# One shared agent connection for the whole app, not one per websocket.
+#
+# Originally each /ws connection got its own ClaudeSDKClient from a
+# pre-warmed pool, so the agent's conversation context started fresh
+# every time -- which meant desktop and mobile (or even two tabs) felt
+# like talking to two different, disconnected instances of Neural with
+# no shared memory of what was just discussed. A single shared client
+# makes every device part of the same ongoing conversation, which is
+# what "the same Neural" should feel like regardless of which screen
+# you're using.
+#
+# _chat_lock serializes actual turns (and connect/reconnect) so two
+# devices sending messages at the same moment can't interleave into the
+# same in-flight query -- the second one just waits its turn, same as if
+# one person were juggling two devices. Fine for a personal, single-user
+# assistant.
+#
+# Spinning up a client is slow -- it boots the `claude` CLI as a
+# subprocess and launches the Playwright MCP server through npx, which
+# together took ~20 seconds when measured. That cost now lands once, at
+# server startup (kicked off in the background so it doesn't block
+# static-file/API serving), instead of on anyone's first message.
+_shared_client: "ClaudeSDKClient | None" = None
+_chat_lock = asyncio.Lock()
+
+
+async def _warm_shared_client() -> None:
+    global _shared_client
+    async with _chat_lock:
+        if _shared_client is not None:
+            return
+        try:
+            client = new_client()
+            await client.connect()
+            _shared_client = client
+        except Exception as e:  # noqa: BLE001 -- warming is best effort
+            logger.error("Failed to pre-warm the shared agent client: %s", e)
+
+
+async def _run_turn(text: str):
+    """Run one chat turn on the shared client, serialized against every
+    other device/tab. Lazily (re)connects if the shared client doesn't
+    exist yet or died. Returns the async iterator of SDK messages for the
+    caller to stream to its own websocket."""
+    global _shared_client
+    async with _chat_lock:
+        if _shared_client is None:
+            _shared_client = new_client()
+            await _shared_client.connect()
+        try:
+            await _shared_client.query(text)
+        except Exception as e:
+            logger.error("Shared agent client query failed, reconnecting: %s", e)
+            try:
+                await _shared_client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            _shared_client = new_client()
+            await _shared_client.connect()
+            await _shared_client.query(text)
+        async for msg in _shared_client.receive_response():
+            yield msg
+
+
+def _chat_history(limit: int = 40) -> list[dict]:
+    """Recent user/assistant chat turns from the shared EventBus history,
+    so a device that just opened the app (or reopened it) sees the same
+    recent conversation another device already had -- visual parity to
+    match the shared agent context above."""
+    return [e for e in bus.history() if e.get("type") == "message"][-limit:]
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_sentences(buf: str) -> tuple[list[str], str]:
+    """Split buf into complete sentences plus a trailing incomplete
+    fragment that should stay buffered until more text (or a final
+    flush) arrives. A crude heuristic -- split right after a ./!/?
+    followed by whitespace -- good enough for short conversational voice
+    replies, not full NLP sentence segmentation (an abbreviation like
+    "Dr." can false-split; acceptable for how short these replies are)."""
+    parts = _SENTENCE_SPLIT_RE.split(buf)
+    if len(parts) <= 1:
+        return [], buf
+    return parts[:-1], parts[-1]
+
+
+async def _notification_bridge() -> None:
+    """Forward select EventBus events to Web Push, so the phone gets
+    alerted for things that matter even when the PWA isn't open in the
+    foreground: automation results (success or failure) and real tool/
+    voice errors. Deliberately narrow -- routine tool_use/tool_result
+    chatter during an interactive chat session stays in the Activity
+    feed only, or every automation run and TTS hiccup would spam the
+    user's lock screen. Runs for the app's lifetime; started once at
+    startup."""
+    queue = bus.subscribe()
+    try:
+        while True:
+            event = await queue.get()
+            event_type = event.get("type")
+            if event_type == "automation_run" and event.get("status") in ("completed", "error"):
+                status = event["status"]
+                title = f"Automation: {event.get('name') or '?'}"
+                body = event.get("result") or ("Failed" if status == "error" else "Done")
+                await asyncio.to_thread(
+                    push.send_notification, title, body[:180], f"automation-{event.get('id')}"
+                )
+            elif event_type == "tts_error":
+                message = event.get("message", "")
+                # Skip the routine "not configured" notice -- that fires on
+                # every voice turn until ElevenLabs is set up, which is an
+                # expected state, not an alert-worthy failure.
+                if message and not message.startswith("ElevenLabs not configured"):
+                    await asyncio.to_thread(
+                        push.send_notification, "Neural voice error", message[:180], "tts-error"
+                    )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        bus.unsubscribe(queue)
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    automations.start_scheduler()
+    asyncio.create_task(_warm_shared_client())
+    asyncio.create_task(_notification_bridge())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    if _shared_client is not None:
+        try:
+            await _shared_client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.middleware("http")
+async def no_cache(request, call_next):
+    """Dev-mode: never let the browser cache the frontend. Without this,
+    changing app.js/index.html and reloading can silently keep running the
+    OLD cached script -- which looks exactly like a broken app."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _event_from_message(msg, text_buffer: list, source: str = "chat"):
+    """Turn one SDK message into a small JSON-able event for the frontend,
+    and publish tool activity to the shared EventBus so every open tab's
+    activity feed sees it (not just the tab that sent the message).
+
+    Also appends any assistant text to text_buffer in place, so the
+    caller can synthesize speech for the whole turn once it's done.
+    """
+    if isinstance(msg, AssistantMessage):
+        blocks = []
+        for block in msg.content:
+            if isinstance(block, TextBlock):
+                blocks.append({"kind": "text", "text": block.text})
+                text_buffer.append(block.text)
+            elif isinstance(block, ToolUseBlock):
+                blocks.append(
+                    {"kind": "tool_use", "tool": block.name, "input": block.input}
+                )
+                bus.publish(
+                    {
+                        "type": "tool_use",
+                        "tool": block.name,
+                        "input": block.input,
+                        "source": source,
+                    }
+                )
+        return {"type": "assistant", "blocks": blocks} if blocks else None
+
+    if isinstance(msg, UserMessage):
+        blocks = []
+        for block in getattr(msg, "content", []) or []:
+            if isinstance(block, ToolResultBlock):
+                blocks.append(
+                    {
+                        "kind": "tool_result",
+                        "tool_use_id": block.tool_use_id,
+                        "content": block.content,
+                        "is_error": getattr(block, "is_error", False),
+                    }
+                )
+                bus.publish(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.tool_use_id,
+                        "is_error": getattr(block, "is_error", False),
+                        "source": source,
+                    }
+                )
+        return {"type": "tool_results", "blocks": blocks} if blocks else None
+
+    if isinstance(msg, ResultMessage):
+        return {"type": "result", "cost_usd": getattr(msg, "total_cost_usd", None)}
+
+    return None
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    # Every reply now always talks (not just when the mic was used to ask
+    # it) and speaks AS the response is written, not after it's fully
+    # generated: as assistant text streams in, complete sentences are
+    # peeled off and handed to TTS the moment they're done, each one
+    # sent to the frontend the moment ITS audio is ready -- so playback
+    # of the first sentence can start while later sentences are still
+    # being generated/synthesized, instead of waiting for the whole
+    # reply. Chunks race each other to finish synthesis (network latency
+    # varies), so each carries a "seq" and the frontend plays them back
+    # in seq order, not arrival order.
+    #
+    # Those per-sentence TTS calls run as background tasks so they never
+    # block pulling the next chunk of text off the SDK's response stream
+    # -- text keeps appearing in the chat log at full speed regardless of
+    # how long speech synthesis takes. But a raw websocket connection
+    # only safely supports ONE writer at a time, so the main loop and
+    # every background TTS task funnel their sends through one queue,
+    # drained by a single dedicated writer coroutine below, rather than
+    # calling websocket.send_text() concurrently from multiple tasks.
+    out_queue: "asyncio.Queue[str]" = asyncio.Queue()
+
+    async def _writer() -> None:
+        while True:
+            out_queue_item = await out_queue.get()
+            await websocket.send_text(out_queue_item)
+
+    writer_task = asyncio.create_task(_writer())
+
+    async def _send(obj: dict) -> None:
+        await out_queue.put(json.dumps(obj))
+
+    # Recent chat history from any device, so a newly (re)opened app looks
+    # like the same ongoing conversation instead of a blank slate -- see
+    # _chat_history()/the shared-client comment above.
+    await _send({"type": "history", "messages": _chat_history()})
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            payload = json.loads(raw)
+
+            if payload.get("type") == "interrupt":
+                if _shared_client is not None:
+                    await _shared_client.interrupt()
+                continue
+
+            text = payload.get("text", "")
+            if not text:
+                continue
+
+            bus.publish({"type": "message", "role": "user", "text": text, "source": "chat"})
+
+            text_buffer: list = []
+            speech_pending = ""
+            audio_seq = 0
+            tts_tasks: list = []
+
+            async def _speak(chunk: str, seq: int) -> None:
+                result = await tts.synthesize(chunk)
+                out: dict = {"type": "audio", "seq": seq}
+                if result:
+                    audio, mime = result
+                    out["mime"] = mime
+                    out["data"] = base64.b64encode(audio).decode("ascii")
+                else:
+                    # Every TTS tier failed for this one sentence -- tell
+                    # the frontend so it can skip this seq rather than
+                    # waiting forever for audio that's never coming.
+                    out["data"] = None
+                await _send(out)
+
+            async for msg in _run_turn(wrap_for_voice(text)):
+                event = _event_from_message(msg, text_buffer)
+                if event is None:
+                    continue
+                await _send(event)
+                if event["type"] == "assistant":
+                    for block in event["blocks"]:
+                        if block["kind"] == "text":
+                            speech_pending += block["text"]
+                    sentences, speech_pending = _split_sentences(speech_pending)
+                    for sentence in sentences:
+                        sentence = sentence.strip()
+                        if sentence:
+                            audio_seq += 1
+                            tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
+
+            # Flush whatever's left in the buffer (a reply that doesn't
+            # end on ./!/? -- common for short spoken replies) as the
+            # final chunk.
+            tail = speech_pending.strip()
+            if tail:
+                audio_seq += 1
+                tts_tasks.append(asyncio.create_task(_speak(tail, audio_seq)))
+
+            if text_buffer:
+                bus.publish(
+                    {"type": "message", "role": "assistant", "text": "".join(text_buffer), "source": "chat"}
+                )
+
+            if tts_tasks:
+                await asyncio.gather(*tts_tasks)
+            # Tells the frontend exactly how many audio chunks to expect
+            # for this turn, so it knows when the reply is fully spoken
+            # even though chunks arrive (and finish synthesizing) out of
+            # order -- see the frontend's audio queue for the other half
+            # of this.
+            await _send({"type": "audio_done", "count": audio_seq})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # No client-disconnect here -- the agent client is shared across
+        # every device/tab, so one of them closing its socket must not
+        # tear down the conversation for the others (only actual app
+        # shutdown does that, see _on_shutdown above). Just stop this
+        # connection's own writer.
+        writer_task.cancel()
+        try:
+            await writer_task
+        except asyncio.CancelledError:
+            pass
+
+
+@app.websocket("/events")
+async def events_endpoint(websocket: WebSocket):
+    """Read-only live activity feed. Any number of tabs can connect; each
+    gets recent history on connect, then a live stream of everything
+    published to the EventBus afterwards (chat tool use, automation runs,
+    etc.) -- decoupled from the interactive /ws chat socket so it never
+    blocks on, or is blocked by, an in-flight chat turn."""
+    await websocket.accept()
+    for event in bus.history():
+        await websocket.send_text(json.dumps(event))
+    queue = bus.subscribe()
+    try:
+        while True:
+            event = await queue.get()
+            await websocket.send_text(json.dumps(event))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        bus.unsubscribe(queue)
+
+
+class AutomationIn(BaseModel):
+    name: str
+    cron: str
+    prompt: str
+    enabled: bool = True
+
+
+class AutomationToggle(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/config")
+async def api_config():
+    """Non-secret settings the frontend needs -- e.g. the wake phrase for
+    continuous voice listening. Never put API keys or tokens here."""
+    return {"wake_phrase": config.WAKE_PHRASE}
+
+
+@app.get("/media/{token}")
+async def get_media(token: str):
+    """Serves a file registered by the media_tools MCP tool, e.g. so
+    Buffer's servers can fetch a local screen recording or generated
+    image by URL (see backend/media.py -- Buffer attaches media by URL,
+    not by upload). Files are exposed by random token, not by real path,
+    and the token expires after 24h; this is not a general file server."""
+    path = media.resolve(token)
+    if not path:
+        raise HTTPException(status_code=404, detail="not found or expired")
+    return FileResponse(path)
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str
+    keys: dict[str, str]
+    expirationTime: float | None = None
+
+
+@app.get("/api/push/vapid-public-key")
+async def api_push_vapid_key():
+    return {"key": push.VAPID_PUBLIC_KEY}
+
+
+@app.post("/api/push/subscribe")
+async def api_push_subscribe(body: PushSubscriptionIn):
+    push.add_subscription(body.model_dump(exclude_none=True))
+    return {"ok": True}
+
+
+@app.post("/api/push/unsubscribe")
+async def api_push_unsubscribe(body: dict):
+    ok = push.remove_subscription(body.get("endpoint", ""))
+    return {"ok": ok}
+
+
+@app.get("/api/automations")
+async def api_list_automations():
+    return automations.list_automations()
+
+
+@app.post("/api/automations")
+async def api_create_automation(body: AutomationIn):
+    return automations.create_automation(
+        name=body.name, cron=body.cron, prompt=body.prompt, enabled=body.enabled
+    )
+
+
+@app.delete("/api/automations/{task_id}")
+async def api_delete_automation(task_id: str):
+    ok = automations.delete_automation(task_id)
+    return {"deleted": ok}
+
+
+@app.post("/api/automations/{task_id}/toggle")
+async def api_toggle_automation(task_id: str, body: AutomationToggle):
+    result = automations.toggle_automation(task_id, body.enabled)
+    return result or {"error": "not found"}
+
+
+@app.post("/api/automations/{task_id}/run")
+async def api_run_automation_now(task_id: str):
+    asyncio.create_task(automations.run_automation(task_id))
+    return {"started": True}
+
+
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <title>Neural</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#070b0d" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Neural" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="bg-grid"></div>
+    <div class="bg-glow"></div>
+
+    <header class="topbar">
+      <div class="brand">NEURAL</div>
+      <div class="topbar-right">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status">CONNECTING</span>
+        <span class="sep">·</span>
+        <button id="voice-toggle" class="pill" type="button">WAKE WORD OFF</button>
+        <button id="notif-toggle" class="pill" type="button">ALERTS OFF</button>
+        <span class="sep hide-narrow">·</span>
+        <span id="uptime" class="mono hide-narrow">00:00:00</span>
+        <button id="panel-toggle" class="icon-btn panel-toggle-btn" type="button" aria-label="Activity &amp; automations">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M3 6h18v2H3zM3 11h18v2H3zM3 16h18v2H3z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="orb-stage">
+      <div class="orb" id="orb">
+        <div class="orb-ring orb-ring-2"></div>
+        <div class="orb-ring orb-ring-1"></div>
+        <div class="orb-core"></div>
+        <div class="orb-particles">
+          <span></span><span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+      <div class="orb-label" id="core-state">STANDBY</div>
+      <div class="orb-sub" id="voice-support-note" hidden>Voice input isn't supported in this browser — try Chrome or Edge.</div>
+    </div>
+
+    <main class="stage">
+      <div class="side-backdrop" id="side-backdrop"></div>
+      <section class="chat-col">
+        <div id="chat-log"></div>
+        <form id="chat-form">
+          <button type="button" id="mic-btn" class="mic-btn" title="Push to talk">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          </button>
+          <input id="chat-input" autocomplete="off" placeholder="Talk to Neural…" />
+          <button type="submit" class="send-btn" aria-label="Send">
+            <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
+          </button>
+        </form>
+      </section>
+
+      <aside class="side-col" id="side-col">
+        <div class="side-block" id="block-activity">
+          <div class="side-label">ACTIVITY</div>
+          <div class="side-list scroll" id="activity-feed"></div>
+        </div>
+
+        <div class="side-block" id="block-automations">
+          <div class="side-label">
+            AUTOMATIONS
+            <button id="automation-open-modal" class="pill small" type="button">+ New</button>
+          </div>
+          <div class="side-list scroll" id="automations-list"></div>
+        </div>
+      </aside>
+    </main>
+
+    <div class="modal-backdrop" id="automation-modal-backdrop" hidden>
+      <div class="modal" id="automation-modal">
+        <div class="modal-head">
+          <h3>New Automation</h3>
+          <button type="button" id="automation-modal-close" class="icon-btn">✕</button>
+        </div>
+        <form id="automation-form">
+          <label>Name<input id="auto-name" placeholder="Morning briefing" autocomplete="off" /></label>
+          <label>What should Neural do?<textarea id="auto-prompt" rows="3" placeholder="Check my calendar and unread email, then summarize what's coming up today."></textarea></label>
+
+          <label>Repeat
+            <select id="auto-freq">
+              <option value="daily">Every day</option>
+              <option value="weekly">Every week</option>
+              <option value="minutes">Every N minutes</option>
+              <option value="custom">Custom (cron)</option>
+            </select>
+          </label>
+
+          <div id="freq-daily" class="freq-fields">
+            <label>At<input type="time" id="auto-time" value="08:00" /></label>
+          </div>
+
+          <div id="freq-weekly" class="freq-fields" hidden>
+            <label>On
+              <div class="day-picker">
+                <button type="button" class="day" data-day="1">Mon</button>
+                <button type="button" class="day" data-day="2">Tue</button>
+                <button type="button" class="day" data-day="3">Wed</button>
+                <button type="button" class="day" data-day="4">Thu</button>
+                <button type="button" class="day" data-day="5">Fri</button>
+                <button type="button" class="day" data-day="6">Sat</button>
+                <button type="button" class="day" data-day="0">Sun</button>
+              </div>
+            </label>
+            <label>At<input type="time" id="auto-time-weekly" value="08:00" /></label>
+          </div>
+
+          <div id="freq-minutes" class="freq-fields" hidden>
+            <label>Every<input type="number" id="auto-minutes" min="1" max="59" value="15" /> minutes</label>
+          </div>
+
+          <div id="freq-custom" class="freq-fields" hidden>
+            <label>Cron expression<input id="auto-cron-raw" placeholder="0 8 * * *" autocomplete="off" /></label>
+            <p class="hint">minute hour day-of-month month day-of-week — e.g. "0 8 * * *" = every day at 8:00 AM</p>
+          </div>
+
+          <div class="cron-preview" id="cron-preview">Runs: daily at 8:00 AM</div>
+
+          <div class="modal-actions">
+            <button type="button" id="automation-cancel" class="pill">Cancel</button>
+            <button type="submit" class="pill primary">Create</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <audio id="tts-player" hidden></audio>
+
+  <script src="app.js"></script>
+</body>
+</html>

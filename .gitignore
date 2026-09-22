@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+node_modules/
+.DS_Store
+vapid_private_key.pem
+push_subscriptions.json
+media/
+
+# Personal/runtime state -- not meant to be versioned or shared
+memory/
+automations.json
+output/
+
+# Playwright MCP's own trace/console/page-snapshot logs -- can contain
+# content from live browser sessions (WhatsApp/Slack/ChatGPT pages)
+.playwright-mcp/
+
+# Stray local test artifacts
+test.mp3
