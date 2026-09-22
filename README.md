@@ -335,6 +335,22 @@ actual code and the actual data, not guessed at):
    capture the model's actual final text, not any stray tool/skill
    content that happened to have a `.text`-like attribute.
 
+**A fourth bug, found once #1-3 above were already fixed:** desktop/
+Android push started working, but iPhone still got nothing, now failing
+with `403 {"reason":"BadJwtToken"}` from `web.push.apple.com`
+specifically. Cause: `VAPID_CONTACT_EMAIL`'s own placeholder default,
+`mailto:neural@localhost`. Google's FCM accepts a `@localhost` sub claim
+without complaint, but Apple's push service validates it strictly and
+rejects reserved/placeholder domains (`@localhost`, `@example.com`,
+anything ending `.invalid`/`.test`) outright -- confirmed against real,
+documented reports of this exact error from other projects hitting the
+same thing. That mismatch is what made it so easy to miss: push looked
+like it was working (desktop/Android succeeded) with nothing pointing at
+this value as the reason iPhones got nothing. **This value has to be a
+real `mailto:` address or a real `https://` URL you actually control,
+not a placeholder** -- set to your own email now, and the app also warns
+loudly at startup if this ever regresses to a placeholder-looking value.
+
 **To verify push is actually reaching a device right now**, just ask
 Neural in chat: "send me a test notification." It uses the exact same
 `send_notification` -> `push.py` path an automation result does, and

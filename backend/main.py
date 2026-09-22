@@ -300,6 +300,22 @@ async def _on_startup() -> None:
         "Push notifications: %d device(s) subscribed, VAPID key ready.",
         push.subscription_count(),
     )
+    # Apple's push service (web.push.apple.com) rejects a VAPID sub claim
+    # on a reserved/placeholder domain with 403 "BadJwtToken" -- while
+    # Google's FCM accepts the exact same value without complaint. That
+    # mismatch is what makes this bug so easy to miss: push looks like
+    # it's working (desktop/Android succeed) while iPhones silently get
+    # nothing, with no error pointing at this specific value. Warn loudly
+    # at every boot instead of letting that happen quietly again.
+    _reserved_contact_suffixes = ("@localhost", "@example.com", ".invalid", ".test")
+    if config.VAPID_CONTACT_EMAIL.rstrip("/").lower().endswith(_reserved_contact_suffixes):
+        logger.warning(
+            "VAPID_CONTACT_EMAIL (%s) looks like a placeholder -- Apple's push service "
+            "will likely reject it with 403 BadJwtToken, so iPhone push will silently fail "
+            "even though desktop/Android push works fine. Set it to a real mailto: address "
+            "or a real https:// URL you control in .env and restart.",
+            config.VAPID_CONTACT_EMAIL,
+        )
 
 
 @app.on_event("shutdown")

@@ -140,21 +140,28 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 # Web Push (VAPID) for phone/desktop alerts -- automation results, real
 # tool/voice errors, and anything the agent flags via send_notification.
 # No key to generate by hand: backend/push.py creates and persists a
-# VAPID keypair itself on first run. This contact address is only used
-# inside the signed VAPID JWT some push services log for abuse contact --
-# a real address is a courtesy, not a requirement, for personal use.
+# VAPID keypair itself on first run.
 #
-# Deliberately `os.getenv(...) or default`, NOT `os.getenv(key, default)`:
-# .env.example (and the .env generated from it) ships this key present
-# but blank (VAPID_CONTACT_EMAIL=), same as the other optional keys in
-# this file -- but unlike those (where blank correctly means "feature
-# off", since they're all gated through bool(KEY)), this value is fed
-# straight into every push's VAPID claims unconditionally. os.getenv's
-# default only kicks in when a key is completely ABSENT, not when it's
-# present-but-empty, so the plain form silently produced sub="" here --
-# which pywebpush's own VAPID signing rejects outright ("Missing 'sub'
-# from claims"), and every single push failed with that on every send.
-# That's what made alerts never arrive at all despite valid
-# subscriptions -- confirmed live via the diagnostic logging added
-# above. `or` falls back on any falsy value, empty string included.
+# This is NOT just a courtesy contact -- despite what it looks like, it's
+# an actual functional requirement on iOS specifically. Two real, live
+# bugs were found here, one after the other:
+#   1. Deliberately `os.getenv(...) or default`, NOT `os.getenv(key,
+#      default)`: .env shipped this key present but blank
+#      (VAPID_CONTACT_EMAIL=), which os.getenv's default does NOT cover
+#      (that only triggers when a key is fully ABSENT) -- so every push
+#      went out with sub="", which pywebpush's own VAPID signing flatly
+#      rejects. Every single push failed, every time.
+#   2. Once fixed with a non-empty value, the *placeholder* value used
+#      here (mailto:neural@localhost) turned out to be its own bug:
+#      Google's FCM accepts a @localhost sub claim without complaint,
+#      but Apple's push service (web.push.apple.com) validates it
+#      strictly and rejects reserved/placeholder domains (@localhost,
+#      @example.com, anything ending .invalid/.test) with a 403
+#      "BadJwtToken" -- confirmed against real, documented cases of this
+#      exact error. That's what made it look like push was "working"
+#      (desktop/Android succeeded) while iPhones silently never got
+#      anything, with no error obviously pointing at this value.
+# Bottom line: this MUST be a real mailto: address or a real https://
+# URL you actually control, not a placeholder -- see main.py's startup
+# check below, which warns loudly if this still looks like one.
 VAPID_CONTACT_EMAIL = os.getenv("VAPID_CONTACT_EMAIL") or "mailto:neural@localhost"

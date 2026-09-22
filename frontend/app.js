@@ -217,6 +217,58 @@ const automationAudioEl = new Audio();
 let automationQueue = [];     // {seq, mime, data} not yet played
 let automationNextSeq = 1;
 
+// iOS Safari (unlike desktop Chrome/Edge) refuses to play() an <audio>
+// element unless that exact call happens synchronously inside a real
+// user gesture (tap/click) -- and every real play() here happens later,
+// async, after a WebSocket round-trip, which is what silently killed
+// spoken replies on mobile while text still arrived fine (a rejected
+// play() throws NotAllowedError, which playAudioChunk's .catch(onDone)
+// swallows as if the clip had just finished, with nothing visibly
+// wrong). Fix: "warm up" both audio elements once, on the very first
+// tap anywhere on the page, with a real (if silent) play() call made
+// directly inside that gesture -- WebKit then treats each element as
+// unlocked for the rest of the page's lifetime, so later async play()
+// calls succeed normally. Each <audio> element needs its OWN unlock,
+// hence doing both here rather than just ttsPlayer.
+const _SILENT_AUDIO_SRC =
+  "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAAAAAAAA";
+let _audioUnlocked = false;
+
+function unlockAudioPlayback() {
+  if (_audioUnlocked) return;
+  _audioUnlocked = true;
+  // Also create/resume the AudioContext used for volume-boosting TTS
+  // playback (see ensureAudioBoost above) right here, inside this same
+  // real gesture. iOS starts every AudioContext "suspended" and, like
+  // <audio>.play(), typically only honors .resume() when it's called
+  // (or at least *triggered*) from within a genuine user gesture --
+  // otherwise it can stay suspended forever even though .resume() was
+  // technically called later from async code, which would mean no
+  // sound ever comes out of the boosted path even after the <audio>
+  // unlock above succeeds.
+  ensureAudioBoost();
+  for (const el of [ttsPlayer, automationAudioEl]) {
+    try {
+      const prevSrc = el.src;
+      el.src = _SILENT_AUDIO_SRC;
+      const p = el.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          try {
+            el.pause();
+            el.src = prevSrc || "";
+          } catch (e) {}
+        }).catch(() => {});
+      }
+    } catch (e) {
+      // Best-effort -- if this fails, later playback just fails the
+      // same way it always did on this browser, no worse off.
+    }
+  }
+}
+
+document.addEventListener("pointerdown", unlockAudioPlayback, { once: true });
+
 function tryPlayNextAutomationChunk() {
   if (automationAudioEl.dataset.playing === "1") return;
   const idx = automationQueue.findIndex((c) => c.seq === automationNextSeq);
