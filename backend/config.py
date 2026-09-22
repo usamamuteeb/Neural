@@ -144,4 +144,18 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 # VAPID keypair itself on first run. This contact address is only used
 # inside the signed VAPID JWT some push services log for abuse contact --
 # a real address is a courtesy, not a requirement, for personal use.
-VAPID_CONTACT_EMAIL = os.getenv("VAPID_CONTACT_EMAIL", "mailto:neural@localhost")
+#
+# Deliberately `os.getenv(...) or default`, NOT `os.getenv(key, default)`:
+# .env.example (and the .env generated from it) ships this key present
+# but blank (VAPID_CONTACT_EMAIL=), same as the other optional keys in
+# this file -- but unlike those (where blank correctly means "feature
+# off", since they're all gated through bool(KEY)), this value is fed
+# straight into every push's VAPID claims unconditionally. os.getenv's
+# default only kicks in when a key is completely ABSENT, not when it's
+# present-but-empty, so the plain form silently produced sub="" here --
+# which pywebpush's own VAPID signing rejects outright ("Missing 'sub'
+# from claims"), and every single push failed with that on every send.
+# That's what made alerts never arrive at all despite valid
+# subscriptions -- confirmed live via the diagnostic logging added
+# above. `or` falls back on any falsy value, empty string included.
+VAPID_CONTACT_EMAIL = os.getenv("VAPID_CONTACT_EMAIL") or "mailto:neural@localhost"
