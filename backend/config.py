@@ -51,6 +51,16 @@ ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
 ADZUNA_ENABLED = bool(ADZUNA_APP_ID and ADZUNA_APP_KEY)
 
+# Stock footage (Pexels) -- free, real video clips for content creation,
+# used after three separate "free" AI video generators (Sora, then
+# Google Veo/Gemini, then Kling AI) each turned out not to actually be
+# free on an ongoing basis -- see backend/stock_footage.py's docstring
+# for the full story. Confirmed against Pexels' own API docs: genuinely
+# free forever, no card, 200 requests/hour, 20,000/month, no trial.
+# Sign up instantly at https://www.pexels.com/api/.
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+PEXELS_ENABLED = bool(PEXELS_API_KEY)
+
 WAKE_PHRASE = os.getenv("WAKE_PHRASE", "Wake up")
 
 # Empty string = let the Agent SDK pick its own default model.

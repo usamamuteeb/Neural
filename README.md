@@ -491,46 +491,49 @@ real posts. To turn it on:
 If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
 -- nothing else depends on it.
 
-## AI video generation (Kling AI)
+## Stock footage (Pexels)
 
-For a post that needs a video generated from scratch rather than edited
-from existing footage, Neural drives your own Kling AI account through
-the browser -- same session-persists-after-login mechanism as ChatGPT,
-WhatsApp, and Slack. No API key, no config flag, nothing to add to
-`.env`.
+For a post that needs a video clip that isn't already on the machine,
+Neural uses a `search_stock_video` tool backed by Pexels' own official
+Video Search API -- a plain API call, no browser, no login session, no
+daily-quota bookkeeping.
 
-**Setup (one-time):** open [app.klingai.com](https://app.klingai.com) in
-whatever browser Neural's Playwright profile uses, and sign in with
-"Continue with Google" using the same Google account already set up for
-Gmail/Calendar -- no separate password to manage, no credit card.
+**Why real stock footage instead of AI-generated video:** three
+different "free" AI video options were tried here, in order, and each
+one turned out not to actually be free on an ongoing basis:
 
-**Why Kling and not Sora:** Sora (OpenAI's video model) was discontinued
--- the web/app shut down April 26, 2026, and API access followed on
-September 24, 2026 -- so it's simply gone, not a cost trade-off we made.
-Google's Gemini/Veo was the next candidate, but as of this writing video
-generation there requires a paid Google AI plan (at least Google AI
-Plus, ~$5-8/mo depending on region) even for short clips -- Google's own
-support docs say so plainly, contradicting some blog posts claiming a
-free tier exists. Kling AI's international site (klingai.com, not to be
-confused with any China-only version) offers a genuinely free account
-with no credit card: Google/Apple/email sign-in, confirmed directly on
-their own site.
+1. **Sora** (OpenAI) -- fully discontinued. Web/app shut down April 26,
+   2026; API access followed on September 24, 2026. Not a cost
+   trade-off, it's simply gone.
+2. **Google Veo/Gemini** -- Google's own support docs say video
+   generation needs a paid Google AI plan (at least Google AI Plus,
+   ~$5-8/mo), contradicting some blog posts that claimed a free tier.
+3. **Kling AI** -- looked promising (a genuinely free, no-card sign-up
+   via Google/Apple/email, confirmed live), but the advertised "66
+   credits" turned out, on checking the actual account, to be a
+   one-time signup trial with an expiry date, not a recurring daily
+   allowance. After it lapses, Kling is a paid subscription like the
+   rest.
 
-**Real limitation, not a bug:** the free tier is intentionally modest --
-roughly 5-second clips, 720p, visibly watermarked, with a daily free
-credit allowance good for about 2 renders (per third-party reporting;
-not confirmed on Kling's own pricing page, which requires being signed
-in to view) that resets the next day rather than banking up. This is
-fine for short-form content or as B-roll segments, not for a single
-long, watermark-free video. The intended workflow: generate a few short
-clips (across more than one day if you need more than the daily
-allowance), then stitch/caption/color-grade them together with the
-video editor above -- treat AI-generated clips as raw footage, the same
-as a screen recording or stock video.
+The pattern: every "free" AI video generator treats free as a one-time
+signup hook to get you trying the paid product, not a real ongoing
+tier -- not worth chasing a fourth vendor on the same premise. Pexels'
+API, by contrast, is verifiably free forever (checked directly against
+their own docs): no card, 200 requests/hour, 20,000/month, no trial
+period, been offered this way for years.
 
-If Kling's free tier changes or stops being enough, revisit -- this
-was chosen for being free and simple to log into today, not because
-it's the best video model available.
+**Setup:** free, instant signup at [pexels.com/api](https://www.pexels.com/api/)
+-- no credit card, an API key is issued immediately. Paste it into
+`.env` as `PEXELS_API_KEY`. Leave it blank to keep the feature off.
+
+**How it fits together:** `search_stock_video` returns a direct,
+downloadable file URL per result (fetched with a plain curl/httpx call,
+no session needed), plus duration, resolution, and a credit link
+(Pexels doesn't require attribution, but it's a nice touch). Neural
+downloads the clip, then hands it to the video editor above for
+trimming, captions, color grading, or narration, exactly like a screen
+recording -- real footage is the raw material, the editor is what turns
+it into finished content.
 
 ## Content creation (brand kit)
 
@@ -597,9 +600,10 @@ brand.
 - Video editing via mcp-video (off by default -- see Video editing
   above): trim, caption, color-grade, and compose clips beyond a plain
   screen recording.
-- AI video generation via Kling AI (free account, browser-driven, no
-  API key -- see AI video generation above): short watermarked clips as
-  raw material for the editor above.
+- Stock footage via Pexels' free API (see Stock footage above): real
+  video clips, no browser/login needed, as raw material for the editor
+  above -- used instead of AI video generation after three separate
+  "free" AI video options each turned out to require payment eventually.
 - A brand kit built on first use per brand/project (see Content
   creation above): consistent voice, colors, audience, and hashtags
   without re-explaining them every time.
