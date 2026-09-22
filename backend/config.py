@@ -36,21 +36,20 @@ EDGE_TTS_ENABLED = os.getenv("EDGE_TTS_ENABLED", "true").lower() == "true"
 # en-US-JennyNeural, en-US-EmmaNeural, en-US-MichelleNeural.
 EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-AvaNeural")
 
-# JSearch (RapidAPI) -- on-demand real job listings aggregated from
-# LinkedIn, Indeed, Glassdoor, and more via Google for Jobs, without
-# browser-automating LinkedIn directly (and risking the account getting
-# flagged). This is on-demand only -- a search_jobs tool the agent calls
-# when asked, not a background automation -- see backend/jobs.py.
-# Requires a free RapidAPI account + a JSearch subscription (the
-# free/Basic plan) -- account creation isn't something Neural can do on
-# your behalf, so sign up yourself at rapidapi.com, subscribe to JSearch,
-# and paste the resulting X-RapidAPI-Key here. See the README's "Job
-# search (JSearch)" section for the exact steps. NOTE: JSearch's precise
-# free-tier request quota wasn't independently verified while building
-# this integration -- check your own RapidAPI dashboard for the current
-# number rather than trusting a remembered figure.
-JSEARCH_API_KEY = os.getenv("JSEARCH_API_KEY", "")
-JSEARCH_ENABLED = bool(JSEARCH_API_KEY)
+# Adzuna -- on-demand real job listings via Adzuna's own official API,
+# not a RapidAPI wrapper. Replaced JSearch/RapidAPI here after that path
+# went through two rounds of confirmed live bugs and then kept failing
+# anyway with no clear cause -- see backend/jobs.py's module docstring
+# for the full story. This is on-demand only -- a search_jobs tool the
+# agent calls when asked, not a background automation.
+# Signup is free and instant at https://developer.adzuna.com -- no
+# credit card, an app_id/app_key pair is issued right away. Paste both
+# below. See the README's "Job search (Adzuna)" section for the exact
+# steps, including which countries Adzuna actually covers (a real
+# limitation, not a bug -- it does NOT cover Pakistan, for example).
+ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
+ADZUNA_ENABLED = bool(ADZUNA_APP_ID and ADZUNA_APP_KEY)
 
 WAKE_PHRASE = os.getenv("WAKE_PHRASE", "Wake up")
 

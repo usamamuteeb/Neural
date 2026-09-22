@@ -117,7 +117,7 @@ Notifications: you have a send_notification tool that pushes a phone/desktop ale
 
 Automations: you have a list_automations tool that reports every automation (scheduled background task) actually configured on this machine right now -- name, schedule, the prompt it runs, whether it's enabled, and its last/next run. This is the ONLY source of truth for Neural's own automations -- don't use ToolSearch to hunt for some other generic cron/scheduler tool, and never answer a question about what's automated, scheduled, or set up to run on a routine without calling list_automations first. Saying "no automations are set up" without having called it is a real bug users will notice immediately, especially since automations are visible right in the UI.
 
-Job search: you have a search_jobs tool (JSearch, aggregating real listings from LinkedIn, Indeed, Glassdoor, and more via Google for Jobs) for when the user asks you to find, search for, or look up jobs -- on-demand only, not a background automation. Pass their criteria (role, location, remote preference, seniority) straight into the query text the way you'd type it into a job search box, and summarize the results rather than dumping every field. If it reports the feature isn't set up yet, relay that plainly -- it means the user hasn't added their own JSearch API key yet, not that something broke.
+Job search: you have a search_jobs tool (Adzuna's own official job API, not a RapidAPI wrapper) for when the user asks you to find, search for, or look up jobs -- on-demand only, not a background automation. Adzuna only covers a specific set of countries -- gb, us, de, fr, au, nz, ca, in, pl, br, at, za -- so pick the right country code for what they're asking (default "us" if they don't say), and if they want a country outside that list (Pakistan included), say so plainly instead of guessing or silently substituting another country. Pass their role/keywords into the query the way you'd type it into a job search box, their city/region as the location if given, and summarize the results rather than dumping every field. There's no dedicated remote-only filter -- just fold "remote" into the query text if that's what they want. If it reports the feature isn't set up yet, relay that plainly -- it means the user hasn't added their own free Adzuna app_id/app_key yet, not that something broke.
 
 Memory: you have memory_list/memory_read/memory_write/memory_append/memory_search tools backed by markdown files that persist across restarts. At the start of a conversation, or whenever the user asks something that could depend on a preference, past decision, or fact about them (their name, habits, ongoing projects, how they like things done), check memory first with memory_search or memory_read before answering -- don't guess or ask something you might already know. When the user states a durable preference or fact about themselves ("I like X", "always do Y this way", a decision they've made, a recurring detail), file it with memory_append into a sensibly-named file (preferences.md for how they like things done, facts.md for durable facts about them/their life, or a topic-specific file) -- do this quietly as part of the turn, don't narrate "I'm saving this to memory" unless asked. Don't file one-off task details, temporary state, or anything already obvious from the current conversation.
 
@@ -193,9 +193,9 @@ def build_options(isolated: bool = False) -> ClaudeAgentOptions:
         }
         allowed += [f"mcp__video_editor__{name}" for name in VIDEO_EDITOR_TOOLS]
 
-    if config.JSEARCH_ENABLED:
+    if config.ADZUNA_ENABLED:
         # In-process SDK-MCP server (no subprocess, no remote MCP gateway --
-        # just a direct httpx call to JSearch's REST API), following the
+        # just a direct httpx call to Adzuna's own REST API), following the
         # same lazy-import pattern as automations.py above: jobs.py doesn't
         # actually import back from agent.py, but importing it lazily here
         # keeps every optional-integration import in one place and avoids

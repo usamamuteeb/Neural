@@ -52,11 +52,12 @@ Architecture Plan" doc for the full design and open questions.
     handing to services (Buffer) that fetch media by URL rather than
     accepting uploads.
   - `jobs.py` — the `search_jobs` SDK-MCP tool: on-demand job search via
-    JSearch (RapidAPI), aggregating real listings from LinkedIn, Indeed,
-    Glassdoor, and more through Google for Jobs -- no browser automation
-    against LinkedIn itself, no scheduled runs, just a tool the agent
-    calls when you ask it to find jobs. Off until you add your own
-    `JSEARCH_API_KEY`. See Job search below.
+    Adzuna's own official API (switched from JSearch/RapidAPI -- see Job
+    search below for why) -- no browser automation against LinkedIn
+    itself, no scheduled runs, just a tool the agent calls when you ask
+    it to find jobs. Off until you add your own `ADZUNA_APP_ID`/
+    `ADZUNA_APP_KEY`. Covers a specific set of countries only -- see
+    below.
 - `frontend/` — a plain HTML/JS Progressive Web App, no build step: a chat
   column plus a side rail with a live Activity feed and an Automations
   panel, now including an ALERTS toggle for push notifications. On narrow
@@ -392,33 +393,47 @@ Known platform caveats, not Neural bugs:
 - **YouTube**: Buffer supports YouTube Shorts, not regular long-form video
   uploads.
 
-## Job search (JSearch)
+## Job search (Adzuna)
 
 Ask Neural to find jobs -- "find me remote senior python roles", "any
 marketing manager openings in Chicago posted this week" -- and it calls
-`search_jobs`, a single on-demand tool backed by JSearch on RapidAPI.
-JSearch aggregates real, current listings from LinkedIn, Indeed,
-Glassdoor, and more via Google for Jobs, so you get broad coverage
-without Neural ever browser-automating LinkedIn directly (and risking
-that account getting flagged or banned the way that tends to go). This
-is deliberately on-demand only, not a background automation -- it runs
-when you ask, not on a schedule.
+`search_jobs`, a single on-demand tool. This is deliberately on-demand
+only, not a background automation -- it runs when you ask, not on a
+schedule.
+
+**Switched from JSearch/RapidAPI to Adzuna's own official API.** JSearch
+went through two rounds of confirmed, real bugs (wrong endpoint path,
+wrong param names/values) that got fixed live against RapidAPI's own
+test console -- and then kept failing anyway with no clear cause visible
+from the code or logs. Adzuna is the job board's own directly-documented
+API rather than a third-party wrapper layered on top of one, so there's
+one fewer thing that can be subtly wrong or go down independently of
+anything in this codebase.
+
+**Real limitation, not a bug: Adzuna only covers a specific set of
+countries** -- `gb`, `us`, `de`, `fr`, `au`, `nz`, `ca`, `in`, `pl`, `br`,
+`at`, `za` (check [developer.adzuna.com/docs/regional](https://developer.adzuna.com/docs/regional)
+for the current list -- it has expanded before and may again). It does
+**not** cover Pakistan, or most of Asia, the Middle East, or Eastern
+Europe. `search_jobs` defaults to `us` unless you specify a different
+supported country, and if you ask for one Adzuna doesn't cover, Neural
+will say so plainly rather than guessing or quietly substituting
+something else. There's also no dedicated remote-only filter -- just say
+"remote" as part of what you're searching for.
 
 One-time setup (Neural can't do this part for you -- creating accounts
 on your behalf isn't something it will do):
-1. Sign up for a free account at [rapidapi.com](https://rapidapi.com).
-2. Search for "JSearch" in the API marketplace and subscribe to its
-   free/Basic plan.
-3. Copy the `X-RapidAPI-Key` shown on the JSearch API page.
-4. Paste it into `.env` as `JSEARCH_API_KEY=...` and restart the server.
+1. Sign up for a free account at [developer.adzuna.com](https://developer.adzuna.com)
+   -- instant, no credit card needed.
+2. Your `app_id` and `app_key` are issued right away on your dashboard.
+3. Paste both into `.env` as `ADZUNA_APP_ID=...` and `ADZUNA_APP_KEY=...`,
+   then restart the server.
 
-Until that key is set, `search_jobs` just tells you (and Neural) that
-job search isn't configured yet -- it won't error out or pretend to have
-results. Note: the exact free-tier request quota wasn't independently
-verified while building this integration (RapidAPI's pricing page didn't
-give a clean, confirmable number at the time) -- check your own
-dashboard at rapidapi.com for the current limit rather than trusting a
-remembered figure here.
+Until both are set, `search_jobs` just tells you (and Neural) that job
+search isn't configured yet -- it won't error out or pretend to have
+results. Free tier is capped at a few hundred calls/day -- check your own
+developer.adzuna.com dashboard for the current number rather than
+trusting a remembered figure here.
 
 ## Video editing (mcp-video)
 
@@ -494,9 +509,10 @@ If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
   log and spoken aloud on every open device, exactly like a normal reply
   -- not just a push notification or an Activity-feed entry. See
   Notifications below.
-- On-demand job search via JSearch (`search_jobs`): real listings from
-  LinkedIn, Indeed, Glassdoor, and more, no LinkedIn automation risk.
-  Needs your own free JSearch API key -- see Job search above.
+- On-demand job search via Adzuna (`search_jobs`): real listings, no
+  LinkedIn automation risk, no RapidAPI middleman. Needs your own free
+  Adzuna app_id/app_key -- see Job search above (and its country-
+  coverage caveat).
 - Image editing via ImageMagick (`magick` through Bash, no dedicated
   tool) -- resize, crop, rotate, caption, or convert any image, including
   ones ChatGPT just generated, before posting via Buffer.
