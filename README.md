@@ -491,6 +491,68 @@ real posts. To turn it on:
 If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
 -- nothing else depends on it.
 
+## AI video generation (Kling AI)
+
+For a post that needs a video generated from scratch rather than edited
+from existing footage, Neural drives your own Kling AI account through
+the browser -- same session-persists-after-login mechanism as ChatGPT,
+WhatsApp, and Slack. No API key, no config flag, nothing to add to
+`.env`.
+
+**Setup (one-time):** open [app.klingai.com](https://app.klingai.com) in
+whatever browser Neural's Playwright profile uses, and sign in with
+"Continue with Google" using the same Google account already set up for
+Gmail/Calendar -- no separate password to manage, no credit card.
+
+**Why Kling and not Sora:** Sora (OpenAI's video model) was discontinued
+-- the web/app shut down April 26, 2026, and API access followed on
+September 24, 2026 -- so it's simply gone, not a cost trade-off we made.
+Google's Gemini/Veo was the next candidate, but as of this writing video
+generation there requires a paid Google AI plan (at least Google AI
+Plus, ~$5-8/mo depending on region) even for short clips -- Google's own
+support docs say so plainly, contradicting some blog posts claiming a
+free tier exists. Kling AI's international site (klingai.com, not to be
+confused with any China-only version) offers a genuinely free account
+with no credit card: Google/Apple/email sign-in, confirmed directly on
+their own site.
+
+**Real limitation, not a bug:** the free tier is intentionally modest --
+roughly 5-second clips, 720p, visibly watermarked, with a daily free
+credit allowance good for about 2 renders (per third-party reporting;
+not confirmed on Kling's own pricing page, which requires being signed
+in to view) that resets the next day rather than banking up. This is
+fine for short-form content or as B-roll segments, not for a single
+long, watermark-free video. The intended workflow: generate a few short
+clips (across more than one day if you need more than the daily
+allowance), then stitch/caption/color-grade them together with the
+video editor above -- treat AI-generated clips as raw footage, the same
+as a screen recording or stock video.
+
+If Kling's free tier changes or stops being enough, revisit -- this
+was chosen for being free and simple to log into today, not because
+it's the best video model available.
+
+## Content creation (brand kit)
+
+For any content aimed at a specific brand/project (as opposed to a
+one-off ad hoc post), Neural keeps two things consistent automatically:
+
+- **Voice default:** wise and no-nonsense at the same time -- thoughtful
+  and credible, never fluffy or padded. Applies to every caption, video
+  script, or narration line unless you say otherwise for a specific
+  post.
+- **Brand kit, built the first time you need it:** the first time you
+  ask Neural to create content for a named brand it doesn't already
+  know, it'll ask for the brand's niche, target audience, colors (hex
+  codes or a logo file), and hashtag/handle conventions, then save the
+  answer to `memory/brand/<slug>.md` so it's never asked again for that
+  brand -- just tell it once, at the start of that project's first
+  request.
+
+No setup needed for this -- it's driven entirely by Neural's existing
+memory tools (see the Layout section) the first time you brief it on a
+brand.
+
 ## Working now
 
 - Real-time chat over the same small toolset Claude Code itself uses —
@@ -535,6 +597,12 @@ If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
 - Video editing via mcp-video (off by default -- see Video editing
   above): trim, caption, color-grade, and compose clips beyond a plain
   screen recording.
+- AI video generation via Kling AI (free account, browser-driven, no
+  API key -- see AI video generation above): short watermarked clips as
+  raw material for the editor above.
+- A brand kit built on first use per brand/project (see Content
+  creation above): consistent voice, colors, audience, and hashtags
+  without re-explaining them every time.
 - A responsive, mobile-usable UI: slide-over drawer for Activity/
   Automations, bottom-sheet automation modal, safe-area-aware layout,
   larger touch targets.
