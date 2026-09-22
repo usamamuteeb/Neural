@@ -544,7 +544,14 @@ If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
 - Wake-word listening + mic input work in Chrome/Edge via the browser's
   own speech recognition; Brave's version of that API is broken (a known
   Brave bug, not something fixable on our end) -- use Chrome/Edge for voice
-- Git repo / version control
+- ChatGPT browser login for image generation -- one-time sign-in at
+  chatgpt.com through Neural's own browser tools (same mechanism as
+  WhatsApp/Slack), not yet done, so the image-generation flow described
+  in Social posting above hasn't been exercised for real yet
+- Video editing (mcp-video) confirmed wired up and enabled, but never
+  driven with a real end-to-end prompt (trim/caption/color-grade an
+  actual clip) -- only the underlying command was checked, not the tool
+  in use
 
 ## Safety note
 
