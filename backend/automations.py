@@ -8,6 +8,7 @@ alongside interactive chat activity without being mistaken for it.
 """
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,10 +16,18 @@ from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from claude_agent_sdk import create_sdk_mcp_server, tool
+from claude_agent_sdk import (
+    AssistantMessage,
+    TextBlock,
+    ToolUseBlock,
+    create_sdk_mcp_server,
+    tool,
+)
 
-from .agent import new_client
+from .agent import new_client, wrap_for_automation
 from .events import bus
+
+logger = logging.getLogger("neural.automations")
 
 STORE_PATH = Path(__file__).resolve().parent.parent / "automations.json"
 
@@ -156,29 +165,46 @@ async def run_automation(task_id: str) -> None:
     result_text = ""
     error = None
     try:
-        client = new_client()
+        # isolated=True: see agent.py's build_options for why -- a plain
+        # new_client() here once let the model reach for an unrelated
+        # "schedule a cloud agent" capability instead of just doing the
+        # task, because it inherits every skill/plugin the user's own
+        # `claude` CLI has installed. wrap_for_automation() is the second,
+        # prompt-level layer of the same fix: it tells the model this
+        # prompt's "every morning at 8am..." phrasing describes a routine
+        # that's ALREADY scheduled and running right now, not a new
+        # scheduling request.
+        client = new_client(isolated=True)
         await client.connect()
         try:
-            await client.query(task["prompt"])
+            await client.query(wrap_for_automation(task["prompt"]))
             async for msg in client.receive_response():
-                for block in getattr(msg, "content", []) or []:
-                    text = getattr(block, "text", None)
-                    if text:
-                        result_text += text
-                    tool_name = getattr(block, "name", None)
-                    if tool_name:
-                        bus.publish(
-                            {
-                                "type": "tool_use",
-                                "tool": tool_name,
-                                "input": getattr(block, "input", {}),
-                                "source": f"automation:{name}",
-                            }
-                        )
+                # Only AssistantMessage/TextBlock is the model's own final
+                # answer. The previous version here summed getattr(block,
+                # "text", None) across every message type without checking
+                # what kind of block it was -- which, live, ended up
+                # concatenating unrelated tool/skill content (e.g. a loaded
+                # skill's own instructions) into "last_result" right along
+                # with (or instead of) the real answer.
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            result_text += block.text
+                        elif isinstance(block, ToolUseBlock):
+                            bus.publish(
+                                {
+                                    "type": "tool_use",
+                                    "tool": block.name,
+                                    "input": block.input,
+                                    "source": f"automation:{name}",
+                                }
+                            )
         finally:
             await client.disconnect()
     except Exception as exc:  # noqa: BLE001 -- surface any failure to the feed instead of crashing the scheduler
         error = str(exc)
+
+    result_text = result_text.strip()
 
     tasks = _load()
     if task_id in tasks:
@@ -195,6 +221,24 @@ async def run_automation(task_id: str) -> None:
             "result": (error or result_text)[:500],
         }
     )
+
+    # Deliver the actual result into the normal chat pipeline -- written
+    # AND spoken, exactly like an interactive reply -- regardless of
+    # whether this run fired on its own cron schedule or was started
+    # manually from the UI's "run now" button. Lazy import: main.py
+    # imports this module at its own top level, so importing back at this
+    # module's top would be circular; by the time any run actually
+    # happens the app has finished starting and main is fully loaded.
+    from .main import deliver_assistant_message
+
+    if error:
+        spoken = f'Your "{name}" automation hit an error: {error[:300]}'
+    else:
+        spoken = result_text or f'Your "{name}" automation just finished, but produced no output.'
+    try:
+        await deliver_assistant_message(spoken, source=f"automation:{name}")
+    except Exception as exc:  # noqa: BLE001 -- delivery failing shouldn't crash the scheduler
+        logger.error("Failed to deliver automation result to chat: %s", exc)
 
 
 def start_scheduler() -> None:

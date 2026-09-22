@@ -283,6 +283,64 @@ What triggers a push:
 - Neural itself, any time it calls its `send_notification` tool -- ask it
   to ping you about something ("let me know when...") and it will.
 
+**Automation output now also lands in chat, not just as a push.** Every
+automation result -- whether it fired on its own schedule or you clicked
+"run now" -- is written into the chat log and spoken aloud on every
+device that's currently open, the same as a normal reply, in addition to
+the push notification above. That's the reliable path: a push can always
+get lost to a browser/OS notification setting or a phone that's asleep at
+the wrong moment, but the chat message is there waiting the next time you
+open the app either way (it's saved into the same shared history as
+everything else).
+
+**Three real bugs were found and fixed here** (found by reading the
+actual code and the actual data, not guessed at):
+1. `push.py` called `webpush()` without a `ttl`, which the library
+   defaults to `0` -- meaning "if the device isn't reachable *right this
+   instant*, drop the message instead of queuing it." A phone that's
+   asleep or backgrounded at the exact moment an automation fires (which
+   is most of the time) would never get it, silently, with no error
+   anywhere. Now sent with a 24h TTL so the push service holds it for
+   the device to pick up later.
+2. Nothing in this app ever called `logging.basicConfig(...)`, so every
+   `logger.info(...)` call anywhere in the codebase was silently
+   swallowed by Python's logging defaults -- there was no way to see
+   from the terminal whether a push actually succeeded, failed, or never
+   fired at all. Fixed in `main.py`; you'll now see a line like
+   `Push notifications: 3 device(s) subscribed, VAPID key ready.` at
+   every startup, and `Push: automation 'X' -> N device(s) reached.`
+   every time one completes -- watch for these in the terminal running
+   `uvicorn` if a push still doesn't show up, since they tell you whether
+   the problem is delivery (0 reached) or the OS/browser just not
+   showing the toast (N reached, but nothing appeared -- check Windows
+   Settings > System > Notifications for the browser, and Focus
+   Assist/Do Not Disturb).
+3. A scheduled "check the weather every morning" automation's actual
+   output, found live in `automations.json`, turned out to be the raw
+   instructions of an unrelated "Schedule Cloud Agents" capability, not
+   a weather report -- the model had reached for that instead of doing
+   the task. Root cause: automations ran with the full, unrestricted
+   tool surface of whatever `claude` CLI is installed on this machine
+   (every plugin/skill it has, including something that schedules brand
+   new cloud-hosted agents, unrelated to Neural's own local automations),
+   because `PERMISSION_MODE=bypassPermissions` auto-approves everything
+   and the default settings-loading behavior discovers all of that. Fixed
+   two ways at once: automation runs now use an isolated client
+   (`setting_sources=[]` so none of that gets discovered at all, plus
+   `disallowed_tools=["Skill", "Task"]` as a second layer) and the
+   automation's prompt is wrapped with an explicit "this is a live run of
+   an already-scheduled task, not a request to schedule anything" note.
+   `run_automation()`'s own result-parsing was also fixed to only ever
+   capture the model's actual final text, not any stray tool/skill
+   content that happened to have a `.text`-like attribute.
+
+**To verify push is actually reaching a device right now**, just ask
+Neural in chat: "send me a test notification." It uses the exact same
+`send_notification` -> `push.py` path an automation result does, and
+tells you plainly how many devices it reached (0 means no working
+subscription on that device yet -- re-tap ALERTS; check the Mobile
+access section above if it's a phone over a plain LAN address).
+
 ## Social posting (Buffer)
 
 Ask Neural to post/schedule something for LinkedIn, Instagram, X, Facebook,
@@ -432,6 +490,10 @@ If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
   real TTS/voice errors, and anything Neural itself decides to flag via
   `send_notification` -- reaches your phone/desktop even with the app
   closed, once you flip the ALERTS toggle. See Notifications below.
+- Automation output (scheduled or manually run) is written into the chat
+  log and spoken aloud on every open device, exactly like a normal reply
+  -- not just a push notification or an Activity-feed entry. See
+  Notifications below.
 - On-demand job search via JSearch (`search_jobs`): real listings from
   LinkedIn, Indeed, Glassdoor, and more, no LinkedIn automation risk.
   Needs your own free JSearch API key -- see Job search above.

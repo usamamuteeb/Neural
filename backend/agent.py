@@ -126,7 +126,7 @@ Response style: be concise by default. Skip preamble, skip restating the questio
 Tone: warm, natural, and personable -- like a capable assistant who knows the user well, not a formal corporate bot. Never cold or robotic, but also never romantic, flirtatious, or clingy -- keep it warm and competent, not intimate."""
 
 
-def build_options() -> ClaudeAgentOptions:
+def build_options(isolated: bool = False) -> ClaudeAgentOptions:
     # Lazy import: automations.py imports new_client from this module at
     # its own top level, so importing it back at agent.py's module top
     # would be a circular import at Python's import time. By the time
@@ -213,11 +213,37 @@ def build_options() -> ClaudeAgentOptions:
     )
     if config.ANTHROPIC_MODEL:
         kwargs["env"] = {"ANTHROPIC_MODEL": config.ANTHROPIC_MODEL}
+
+    if isolated:
+        # Used for automation runs (see automations.py). Root cause of a
+        # real bug found live: a scheduled "check the weather every
+        # morning" run actually invoked a totally unrelated "Schedule
+        # Cloud Agents" capability instead of doing the task -- because
+        # PERMISSION_MODE=bypassPermissions already auto-approves every
+        # tool the underlying `claude` CLI knows about, and leaving
+        # setting_sources unset (the default) makes the CLI load ALL
+        # filesystem settings (user + project + local), which is exactly
+        # how it discovers whatever marketplace plugins/skills are
+        # installed for the user's own everyday interactive CLI use --
+        # including, on this machine, something that schedules brand-new
+        # cloud-hosted agents. None of that has anything to do with
+        # Neural's own local automations (only list_automations is ever
+        # exposed to the model; creating/editing one is UI-only, see
+        # automations.py), so a one-shot automation run gets isolated
+        # from it entirely: setting_sources=[] stops the CLI from
+        # discovering any of that (built-ins like Bash/WebSearch/WebFetch
+        # aren't loaded via settings sources, so they're unaffected and
+        # still work), and disallowed_tools hard-blocks the generic
+        # Skill/Task tools as a second layer even if some skill is
+        # exposed another way later.
+        kwargs["setting_sources"] = []
+        kwargs["disallowed_tools"] = list(kwargs.get("disallowed_tools") or []) + ["Skill", "Task"]
+
     return ClaudeAgentOptions(**kwargs)
 
 
-def new_client() -> ClaudeSDKClient:
-    return ClaudeSDKClient(options=build_options())
+def new_client(isolated: bool = False) -> ClaudeSDKClient:
+    return ClaudeSDKClient(options=build_options(isolated=isolated))
 
 
 # Prepended to the query text (not the system prompt) on every message --
@@ -240,3 +266,30 @@ VOICE_MODE_PREFIX = (
 
 def wrap_for_voice(text: str) -> str:
     return VOICE_MODE_PREFIX + text
+
+
+# Prepended to an automation's own prompt text when it's actually executed
+# (see automations.py's run_automation). Automation prompts are written
+# to describe a recurring routine ("every morning at 8am, check...") since
+# that's what the user typed when setting it up -- but replayed verbatim
+# at run time, that same wording reads exactly like a NEW request to set
+# up a schedule, which is what actually caused the "Schedule Cloud
+# Agents" derailment bug: the model reasonably (if wrongly, in this
+# context) reached for a real scheduling capability instead of realizing
+# it WAS that already-scheduled run. This wrapper heads that off at the
+# prompt level, on top of the tool-level isolation in build_options().
+AUTOMATION_MODE_PREFIX = (
+    "[This is a live, automatic run of a task already scheduled inside Neural -- "
+    "it is happening right now because that schedule just fired, NOT a request to "
+    "create, change, or set up any schedule, cron job, or recurring cloud agent. "
+    "Never use a scheduling, cron, or cloud-agent-scheduling tool or skill here, "
+    "even if the wording below sounds like a recurring instruction -- that wording "
+    "just describes what this automation already does on its own. Actually perform "
+    "the task described below, right now, and answer with the real, final result "
+    "in 1-3 short sentences, no markdown, headers, or lists -- this will be shown "
+    "as a normal chat message and also spoken aloud via text-to-speech.]\n\n"
+)
+
+
+def wrap_for_automation(prompt: str) -> str:
+    return AUTOMATION_MODE_PREFIX + prompt

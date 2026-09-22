@@ -205,6 +205,47 @@ function onAudioDone(count) {
   maybeFinishSpeaking();
 }
 
+/* ---------------- Automation output (background chat delivery) ---------------- */
+// An automation can finish at any moment -- on its own cron schedule, or
+// via the "run now" button -- including while a live chat turn is
+// already streaming text/audio on this exact connection. This runs on a
+// fully separate pipeline (own <audio> element, own queue/state, its own
+// plain chat bubble) instead of reusing the live-turn machinery below,
+// so it can never corrupt an in-progress reply's bubble or interleave
+// its audio chunks with the reply's own.
+const automationAudioEl = new Audio();
+let automationQueue = [];     // {seq, mime, data} not yet played
+let automationNextSeq = 1;
+
+function tryPlayNextAutomationChunk() {
+  if (automationAudioEl.dataset.playing === "1") return;
+  const idx = automationQueue.findIndex((c) => c.seq === automationNextSeq);
+  if (idx === -1) return; // still waiting for this seq to arrive
+  const chunk = automationQueue.splice(idx, 1)[0];
+  automationNextSeq++;
+
+  if (chunk.data == null) {
+    tryPlayNextAutomationChunk();
+    return;
+  }
+
+  const bytes = atob(chunk.data);
+  const buffer = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
+  const blob = new Blob([buffer], { type: chunk.mime || "audio/mpeg" });
+  const url = URL.createObjectURL(blob);
+  automationAudioEl.src = url;
+  automationAudioEl.volume = 1.0;
+  automationAudioEl.dataset.playing = "1";
+  const finish = () => {
+    URL.revokeObjectURL(url);
+    automationAudioEl.dataset.playing = "0";
+    tryPlayNextAutomationChunk();
+  };
+  automationAudioEl.play().catch(finish);
+  automationAudioEl.onended = finish;
+}
+
 let socket;
 let assistantDiv = null;
 let historyLoaded = false; // only replay history once per page load, not on every reconnect
@@ -239,6 +280,24 @@ function connect() {
           if (m.role === "user" || m.role === "assistant") addMessage(m.role, m.text);
         }
       }
+      return;
+    }
+
+    // Automation output (see backend/main.py's deliver_assistant_message)
+    // rides its own event types and its own playback pipeline above --
+    // deliberately outside the turn_id system below, since it isn't part
+    // of any interactive turn and must never be dropped or confused with
+    // one.
+    if (data.type === "automation_message") {
+      addMessage("assistant", data.text);
+      return;
+    }
+    if (data.type === "automation_audio") {
+      automationQueue.push({ seq: data.seq, mime: data.mime, data: data.data });
+      tryPlayNextAutomationChunk();
+      return;
+    }
+    if (data.type === "automation_audio_done") {
       return;
     }
 

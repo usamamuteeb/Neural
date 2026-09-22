@@ -130,6 +130,17 @@ def send_notification(title: str, body: str, tag: Optional[str] = None, url: str
                 data=payload,
                 vapid_private_key=str(PRIVATE_KEY_PATH),
                 vapid_claims={"sub": config.VAPID_CONTACT_EMAIL},
+                # pywebpush defaults ttl to 0 if you don't pass it, which tells
+                # the push service (FCM/APNs/etc.) to drop the message
+                # immediately instead of queuing it when the device isn't
+                # reachable at that exact instant -- exactly the normal state
+                # for a phone that's asleep or backgrounded when a scheduled
+                # automation fires. This was silently dropping every push:
+                # nothing here raised an error (a dropped-for-TTL message
+                # isn't a failure from the sender's side), so it looked like
+                # "nothing happens" rather than an exception to catch. 24h
+                # lets the push service hold it until the device reconnects.
+                ttl=86400,
             )
             sent += 1
         except WebPushException as exc:

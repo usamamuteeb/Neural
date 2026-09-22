@@ -37,6 +37,21 @@ from . import automations, config, media, push, tts
 from .agent import new_client, wrap_for_voice
 from .events import bus
 
+# Without this, Python's logging defaults to WARNING at the root logger,
+# so every logger.info() call in this codebase (including the push-
+# notification diagnostics added below) is silently swallowed -- never
+# printed anywhere, not even to this terminal -- and logger.error() calls
+# only happen to appear via Python's fallback "no handler configured"
+# last-resort handler. That silence is exactly what made "alerts aren't
+# working" impossible to diagnose: nothing was actually surfacing whether
+# push sends were succeeding, failing, or never firing at all. uvicorn's
+# own default logging config doesn't set this up for anything outside its
+# own "uvicorn.*" loggers, so it has to happen here.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 logger = logging.getLogger("neural.main")
 
 app = FastAPI(title="Neural")
@@ -113,6 +128,82 @@ def _chat_history(limit: int = 40) -> list[dict]:
     return [e for e in bus.history() if e.get("type") == "message"][-limit:]
 
 
+# Every /ws connection registers its own _send(obj) here for as long as
+# it's open, so output that doesn't originate from that connection's own
+# turn -- specifically, an automation's result -- can still be pushed to
+# every currently-open tab/device live, the same way a live turn's
+# assistant/audio events are. See deliver_assistant_message below.
+_broadcast_sinks: "set" = set()
+
+
+async def _broadcast(obj: dict) -> None:
+    for sink in list(_broadcast_sinks):
+        try:
+            await sink(obj)
+        except Exception:  # noqa: BLE001 -- one dead/closing socket shouldn't block the rest
+            pass
+
+
+async def deliver_assistant_message(text: str, source: str = "automation") -> None:
+    """Deliver a piece of assistant output that didn't come from an
+    interactive /ws turn -- right now, only an automation's finished
+    result (see automations.py's run_automation) -- through the exact
+    same kind of pipeline a live chat turn uses: written into the shared
+    chat history (so it shows up next time any device opens or
+    reconnects, even if nothing was connected when it happened) and, for
+    every device connected right now, shown in the chat log and spoken
+    aloud immediately -- the same as a normal reply, whether the
+    automation was fired by its cron schedule or started manually.
+
+    Deliberately broadcast under its own automation_message/
+    automation_audio/automation_audio_done event types rather than
+    reusing assistant/audio/audio_done -- an automation can finish at any
+    moment, including while a live turn (especially a manually-triggered
+    "run now") is already streaming text/audio on this exact connection,
+    and those events are keyed into shared per-turn state (assistantDiv,
+    currentTurn's seq counters, isSpeaking) on the frontend. Reusing them
+    would risk corrupting whichever one is in flight -- wrong text
+    appended into the wrong bubble, audio chunks racing on the same
+    sequence counter. A separate event namespace (and, client-side, a
+    separate <audio> element and queue) keeps the two completely
+    independent instead."""
+    text = text.strip()
+    if not text:
+        return
+
+    bus.publish({"type": "message", "role": "assistant", "text": text, "source": source})
+    await _broadcast({"type": "automation_message", "text": text})
+
+    sentences, tail = _split_sentences(text)
+    if tail.strip():
+        sentences = sentences + [tail]
+
+    audio_seq = 0
+    tts_tasks: list = []
+
+    async def _speak(chunk: str, seq: int) -> None:
+        result = await tts.synthesize(chunk)
+        out: dict = {"type": "automation_audio", "seq": seq}
+        if result:
+            audio, mime = result
+            out["mime"] = mime
+            out["data"] = base64.b64encode(audio).decode("ascii")
+        else:
+            out["data"] = None
+        await _broadcast(out)
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if sentence:
+            audio_seq += 1
+            tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
+
+    if tts_tasks:
+        await asyncio.gather(*tts_tasks)
+
+    await _broadcast({"type": "automation_audio_done", "count": audio_seq})
+
+
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:])\s+")
 _MIN_CLAUSE_CHARS = 40  # don't fragment short phrases into clipped-sounding audio
@@ -163,8 +254,17 @@ async def _notification_bridge() -> None:
                 status = event["status"]
                 title = f"Automation: {event.get('name') or '?'}"
                 body = event.get("result") or ("Failed" if status == "error" else "Done")
-                await asyncio.to_thread(
+                sent = await asyncio.to_thread(
                     push.send_notification, title, body[:180], f"automation-{event.get('id')}"
+                )
+                # Loud on purpose: push failing silently (0 reached, or an
+                # exception this thread would otherwise swallow) is exactly
+                # what made "no alerts arrive" impossible to diagnose before
+                # -- this line is what you should watch for in this
+                # terminal right after an automation completes.
+                logger.info(
+                    "Push: automation %r -> %d device(s) reached (%d subscribed).",
+                    event.get("name"), sent, push.subscription_count(),
                 )
             elif event_type == "tts_error":
                 message = event.get("message", "")
@@ -172,9 +272,10 @@ async def _notification_bridge() -> None:
                 # every voice turn until ElevenLabs is set up, which is an
                 # expected state, not an alert-worthy failure.
                 if message and not message.startswith("ElevenLabs not configured"):
-                    await asyncio.to_thread(
+                    sent = await asyncio.to_thread(
                         push.send_notification, "Neural voice error", message[:180], "tts-error"
                     )
+                    logger.info("Push: voice error alert -> %d device(s) reached.", sent)
     except asyncio.CancelledError:
         raise
     finally:
@@ -186,6 +287,19 @@ async def _on_startup() -> None:
     automations.start_scheduler()
     asyncio.create_task(_warm_shared_client())
     asyncio.create_task(_notification_bridge())
+    # Visible proof at every boot that push is (or isn't) actually wired up
+    # -- print this in your own terminal instead of guessing: 0 subscribed
+    # means the ALERTS toggle has never successfully completed on any
+    # device (check the Mobile access section in README.md for the
+    # HTTPS/Tailscale requirement), while >0 means subscriptions exist and
+    # a failure to actually receive one is either a delivery-side issue
+    # (watch for the "Push: automation ... -> N device(s) reached" line
+    # this now logs every time one fires) or an OS/browser notification
+    # setting blocking the toast itself.
+    logger.info(
+        "Push notifications: %d device(s) subscribed, VAPID key ready.",
+        push.subscription_count(),
+    )
 
 
 @app.on_event("shutdown")
@@ -298,6 +412,12 @@ async def ws_endpoint(websocket: WebSocket):
 
     async def _send(obj: dict) -> None:
         await out_queue.put(json.dumps(obj))
+
+    # Registered for as long as this connection is open so
+    # deliver_assistant_message (automation results) can push live events
+    # to this tab/device too, not just whichever tab happens to be
+    # mid-turn -- see its definition above.
+    _broadcast_sinks.add(_send)
 
     # Recent chat history from any device, so a newly (re)opened app looks
     # like the same ongoing conversation instead of a blank slate -- see
@@ -415,6 +535,7 @@ async def ws_endpoint(websocket: WebSocket):
         # tear down the conversation for the others (only actual app
         # shutdown does that, see _on_shutdown above). Just stop this
         # connection's own reader/writer.
+        _broadcast_sinks.discard(_send)
         reader_task.cancel()
         writer_task.cancel()
         for task in (reader_task, writer_task):
