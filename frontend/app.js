@@ -105,6 +105,16 @@ function ensureAudioBoost() {
 // keep coming in after the text itself has finished streaming.
 let chunkPlaying = false;     // the <audio> element is mid-playback of one chunk right now
 let expectingAudio = false;   // this turn will produce at least a "no chunks" audio_done
+// Every message sent gets an incrementing id; the backend echoes it back
+// on every event belonging to that turn (assistant text, audio chunks,
+// audio_done, result). If a barge-in starts a NEWER turn before an OLDER
+// one has finished winding down server-side, stray leftover events from
+// the old turn arrive tagged with an id that no longer matches
+// activeTurnId and get dropped -- otherwise they'd bleed into the new
+// turn's chat bubble or audio queue (wrong text appended, chunks played
+// out of order/twice).
+let turnCounter = 0;
+let activeTurnId = null;
 let currentTurn = {
   queue: [],          // {seq, mime, data} not yet played, out of order is fine
   nextSeqToPlay: 1,
@@ -166,7 +176,15 @@ function tryPlayNextChunk() {
 
   if (!isSpeaking) {
     isSpeaking = true;
-    pauseWakeListening();
+    // Deliberately NOT pausing wake-word listening here (unlike before) --
+    // the mic needs to stay live while Neural talks so the user can barge
+    // in and interrupt it, the same way you'd talk over a real assistant.
+    // Risk: SpeechRecognition can pick up Neural's own voice from the
+    // speakers as if it were you talking (an echo/feedback false-positive),
+    // which would self-interrupt for no reason. Modern Chrome/Edge apply
+    // real echo cancellation to mic capture and this held up in testing,
+    // but if it misfires in your setup, turn WAKE WORD off during
+    // playback or use the push-to-talk mic button instead.
     setState("speaking", "SPEAKING");
   }
   chunkPlaying = true;
@@ -221,7 +239,15 @@ function connect() {
           if (m.role === "user" || m.role === "assistant") addMessage(m.role, m.text);
         }
       }
-    } else if (data.type === "assistant") {
+      return;
+    }
+
+    // Every other message type belongs to one turn -- drop anything left
+    // over from a turn a barge-in already superseded (see sendMessage's
+    // turn_id comment above).
+    if (data.turn_id !== undefined && data.turn_id !== activeTurnId) return;
+
+    if (data.type === "assistant") {
       for (const block of data.blocks) {
         if (block.kind === "text") {
           if (!assistantDiv) assistantDiv = addMessage("assistant", "");
@@ -248,12 +274,25 @@ connect();
 
 function sendMessage(text) {
   if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+
+  // Barge-in: a previous reply is still being generated or spoken, so
+  // this new message supersedes it. Tell the backend to actually stop
+  // that turn (not just mute its audio locally) before starting the new
+  // one, and cut local playback immediately so there's no gap where two
+  // replies could overlap.
+  if (isSpeaking || expectingAudio) {
+    socket.send(JSON.stringify({ type: "interrupt" }));
+  }
+  turnCounter += 1;
+  activeTurnId = turnCounter;
+
   addMessage("user", text);
   assistantDiv = null;
+  isSpeaking = false;
   expectingAudio = true; // every reply now always talks -- see main.py
   resetTurnAudio();
   setState("thinking", "PROCESSING");
-  socket.send(JSON.stringify({ type: "message", text }));
+  socket.send(JSON.stringify({ type: "message", text, turn_id: activeTurnId }));
 }
 
 chatForm.addEventListener("submit", (e) => {
@@ -319,7 +358,7 @@ function handleWakeTranscript(transcript) {
 }
 
 function startContinuousListening() {
-  if (!SR || isSpeaking || continuousRecognition) return;
+  if (!SR || continuousRecognition) return;
   const rec = new SR();
   rec.continuous = true;
   rec.interimResults = false;
@@ -340,7 +379,7 @@ function startContinuousListening() {
   };
   rec.onend = () => {
     continuousRecognition = null;
-    if (wakeWordOn && !isSpeaking) startContinuousListening();
+    if (wakeWordOn) startContinuousListening();
   };
   continuousRecognition = rec;
   try {

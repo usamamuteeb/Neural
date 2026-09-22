@@ -197,13 +197,30 @@ reply to finish generating and then synthesizing the whole thing (which
 is what made voice replies feel laggy before), `backend/main.py`'s `/ws`
 handler peels off each complete sentence as it streams in from the model
 and sends it to TTS immediately, so playback of the first sentence can
-start while later sentences are still being written/synthesized. Chunks
+start while later sentences are still being written/synthesized -- and
+since voice replies are capped at 1-3 short sentences, a single long
+sentence with no earlier full stop also gets split at its last
+comma/semicolon once it runs past ~40 characters, so even a one-sentence
+reply doesn't wait for the whole thing before speaking starts. Chunks
 are tagged with a sequence number and the frontend plays them back in
 that order even if a later chunk's speech synthesis finishes first
 (network timing varies) -- see `tryPlayNextChunk`/`onAudioChunk` in
-`app.js`. Sending a new message while a reply is still talking cuts off
-the old audio (the same "barge in" behavior you'd expect from any voice
-assistant) rather than overlapping the two.
+`app.js`.
+
+**Barge-in.** Talking over Neural (or typing a new message) while it's
+still speaking cuts the old reply off immediately -- both the audio
+locally and, via an `interrupt` sent to the backend, the agent turn
+actually generating it, not just muted playback while it keeps working
+in the background. A `turn_id` on every message and event lets the
+frontend tell a barge-in's new turn apart from any stray leftovers the
+old, just-interrupted turn is still finishing up server-side, so they
+don't bleed into the new turn's text or audio. This needed wake-word
+listening to stay live through playback instead of pausing while Neural
+talks (it used to) -- the real risk there is the mic picking up Neural's
+own voice from the speakers as a false "you're talking" trigger; modern
+Chrome/Edge apply real echo cancellation and this held up in testing, but
+if it misfires for you, turn **WAKE WORD** off during playback or use the
+push-to-talk mic button instead.
 
 **Voice engine**: `backend/tts.py` tries three tiers in order --
 1. **edge-tts** (primary, free) -- neural-quality voices via Microsoft

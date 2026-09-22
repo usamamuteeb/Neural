@@ -114,19 +114,35 @@ def _chat_history(limit: int = 40) -> list[dict]:
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:])\s+")
+_MIN_CLAUSE_CHARS = 40  # don't fragment short phrases into clipped-sounding audio
 
 
 def _split_sentences(buf: str) -> tuple[list[str], str]:
-    """Split buf into complete sentences plus a trailing incomplete
-    fragment that should stay buffered until more text (or a final
-    flush) arrives. A crude heuristic -- split right after a ./!/?
-    followed by whitespace -- good enough for short conversational voice
-    replies, not full NLP sentence segmentation (an abbreviation like
-    "Dr." can false-split; acceptable for how short these replies are)."""
+    """Split buf into complete chunks ready for TTS plus a trailing
+    incomplete fragment that should stay buffered until more text (or a
+    final flush) arrives. Primary split is on sentence-ending punctuation
+    (a crude heuristic -- an abbreviation like "Dr." can false-split;
+    acceptable for how short these replies are). On top of that, once
+    the still-incomplete tail gets past _MIN_CLAUSE_CHARS, it's also
+    peeled at its last comma/semicolon/colon -- voice-mode replies are
+    capped at 1-3 short sentences, so a single long sentence with no
+    earlier full stop would otherwise make "sentence-level" streaming
+    provide no real head start at all, defeating the point of speaking
+    as the response is written rather than after it's fully generated."""
     parts = _SENTENCE_SPLIT_RE.split(buf)
-    if len(parts) <= 1:
-        return [], buf
-    return parts[:-1], parts[-1]
+    if len(parts) > 1:
+        complete, tail = parts[:-1], parts[-1]
+    else:
+        complete, tail = [], buf
+
+    if len(tail) > _MIN_CLAUSE_CHARS:
+        clause_parts = _CLAUSE_SPLIT_RE.split(tail)
+        if len(clause_parts) > 1:
+            complete = complete + clause_parts[:-1]
+            tail = clause_parts[-1]
+
+    return complete, tail
 
 
 async def _notification_bridge() -> None:
@@ -247,6 +263,9 @@ def _event_from_message(msg, text_buffer: list, source: str = "chat"):
     return None
 
 
+_DISCONNECTED = object()  # sentinel put on in_queue when the socket closes
+
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -277,8 +296,6 @@ async def ws_endpoint(websocket: WebSocket):
             out_queue_item = await out_queue.get()
             await websocket.send_text(out_queue_item)
 
-    writer_task = asyncio.create_task(_writer())
-
     async def _send(obj: dict) -> None:
         await out_queue.put(json.dumps(obj))
 
@@ -287,19 +304,51 @@ async def ws_endpoint(websocket: WebSocket):
     # _chat_history()/the shared-client comment above.
     await _send({"type": "history", "messages": _chat_history()})
 
+    # Incoming messages are read by their OWN dedicated task, not inline
+    # in the main loop below. Without this, an "interrupt" sent while a
+    # turn is still streaming would just sit unread until that turn's
+    # response loop finished and came back around to read the socket
+    # again -- by which point the whole point of interrupting (barge-in:
+    # stop the old reply, start the new one right away) is already lost.
+    # Running the reader concurrently means interrupt() fires the moment
+    # it arrives, regardless of what the main loop is doing.
+    in_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+
+    async def _reader() -> None:
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                payload = json.loads(raw)
+                if payload.get("type") == "interrupt":
+                    if _shared_client is not None:
+                        try:
+                            await _shared_client.interrupt()
+                        except Exception as e:
+                            logger.error("interrupt() failed: %s", e)
+                    continue
+                await in_queue.put(payload)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await in_queue.put(_DISCONNECTED)
+
+    writer_task = asyncio.create_task(_writer())
+    reader_task = asyncio.create_task(_reader())
+
     try:
         while True:
-            raw = await websocket.receive_text()
-            payload = json.loads(raw)
-
-            if payload.get("type") == "interrupt":
-                if _shared_client is not None:
-                    await _shared_client.interrupt()
-                continue
+            payload = await in_queue.get()
+            if payload is _DISCONNECTED:
+                break
 
             text = payload.get("text", "")
             if not text:
                 continue
+            # Echoed back on every event this turn produces, so the
+            # frontend can tell a barge-in's new turn apart from stray
+            # leftover events a just-interrupted older turn is still
+            # finishing up server-side -- see app.js's sendMessage.
+            turn_id = payload.get("turn_id")
 
             bus.publish({"type": "message", "role": "user", "text": text, "source": "chat"})
 
@@ -310,7 +359,7 @@ async def ws_endpoint(websocket: WebSocket):
 
             async def _speak(chunk: str, seq: int) -> None:
                 result = await tts.synthesize(chunk)
-                out: dict = {"type": "audio", "seq": seq}
+                out: dict = {"type": "audio", "seq": seq, "turn_id": turn_id}
                 if result:
                     audio, mime = result
                     out["mime"] = mime
@@ -326,6 +375,7 @@ async def ws_endpoint(websocket: WebSocket):
                 event = _event_from_message(msg, text_buffer)
                 if event is None:
                     continue
+                event["turn_id"] = turn_id
                 await _send(event)
                 if event["type"] == "assistant":
                     for block in event["blocks"]:
@@ -358,20 +408,20 @@ async def ws_endpoint(websocket: WebSocket):
             # even though chunks arrive (and finish synthesizing) out of
             # order -- see the frontend's audio queue for the other half
             # of this.
-            await _send({"type": "audio_done", "count": audio_seq})
-    except WebSocketDisconnect:
-        pass
+            await _send({"type": "audio_done", "count": audio_seq, "turn_id": turn_id})
     finally:
         # No client-disconnect here -- the agent client is shared across
         # every device/tab, so one of them closing its socket must not
         # tear down the conversation for the others (only actual app
         # shutdown does that, see _on_shutdown above). Just stop this
-        # connection's own writer.
+        # connection's own reader/writer.
+        reader_task.cancel()
         writer_task.cancel()
-        try:
-            await writer_task
-        except asyncio.CancelledError:
-            pass
+        for task in (reader_task, writer_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 @app.websocket("/events")
