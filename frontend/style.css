@@ -394,6 +394,7 @@ button, input, select, textarea { font-family: inherit; }
 .automation-row-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .automation-name { font-size: 0.8rem; color: var(--text); font-weight: 600; }
 .automation-schedule { font-size: 0.68rem; color: var(--muted); margin-top: 2px; }
+.automation-trigger { font-size: 0.68rem; color: var(--muted); margin-top: 2px; font-style: italic; }
 .automation-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
 .icon-btn {

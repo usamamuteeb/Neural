@@ -733,12 +733,13 @@ automationForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = document.getElementById("auto-name").value.trim();
   const prompt = document.getElementById("auto-prompt").value.trim();
+  const voiceTrigger = document.getElementById("auto-trigger").value.trim();
   const cron = currentCron();
   if (!name || !prompt || !cron) return;
   await fetch("/api/automations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, cron, prompt, enabled: true }),
+    body: JSON.stringify({ name, cron, prompt, enabled: true, voice_trigger: voiceTrigger || null }),
   });
   closeModal();
   loadAutomations();
@@ -759,6 +760,7 @@ function renderAutomations(items) {
       "<div>" +
       '<div class="automation-name">' + escapeHtml(a.name) + "</div>" +
       '<div class="automation-schedule">' + escapeHtml(describeCron(a.cron)) + " · next " + escapeHtml(nextRun) + "</div>" +
+      (a.voice_trigger ? '<div class="automation-trigger">trigger: “' + escapeHtml(a.voice_trigger) + '”</div>' : "") +
       "</div>" +
       '<div class="automation-actions">' +
       '<button class="icon-btn" data-action="run" title="Run now">▶</button>' +

@@ -91,6 +91,9 @@
           <label>Name<input id="auto-name" placeholder="Morning briefing" autocomplete="off" /></label>
           <label>What should Neural do?<textarea id="auto-prompt" rows="3" placeholder="Check my calendar and unread email, then summarize what's coming up today."></textarea></label>
 
+          <label>Voice/text trigger phrase (optional)<input id="auto-trigger" placeholder="start my morning brief" autocomplete="off" /></label>
+          <p class="hint">Say or type this exact phrase (with wake word on, or just typed in chat) to run this automation immediately, instead of waiting for its schedule. Leave blank to only run it on schedule or with the ▶ button.</p>
+
           <label>Repeat
             <select id="auto-freq">
               <option value="daily">Every day</option>

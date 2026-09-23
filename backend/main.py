@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import re
+from typing import Optional
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -488,6 +489,29 @@ async def ws_endpoint(websocket: WebSocket):
 
             bus.publish({"type": "message", "role": "user", "text": text, "source": "chat"})
 
+            # Voice-triggered automations: a saved automation can carry a
+            # trigger phrase (set in the automation form), and saying (or
+            # typing) it runs that automation directly instead of going
+            # through a full conversational turn with the agent -- a
+            # fast, deterministic string match rather than an LLM call,
+            # so it's instant and never misfires into a different
+            # interpretation. This is checked before anything else below,
+            # and short-circuits the rest of the loop body entirely: no
+            # _run_turn, no per-sentence TTS for this message. The
+            # matched automation's own real output (and any errors)
+            # arrives shortly afterward through automations.run_automation
+            # -> deliver_assistant_message, the exact same pipeline a
+            # scheduled or "run now" firing already uses.
+            matched = automations.match_voice_trigger(text)
+            if matched:
+                asyncio.create_task(automations.run_automation(matched["id"]))
+                await deliver_assistant_message(
+                    f'Starting your "{matched["name"]}" automation now -- '
+                    "I'll let you know once it's done.",
+                    source=f'voice_trigger:{matched["name"]}',
+                )
+                continue
+
             text_buffer: list = []
             speech_pending = ""
             audio_seq = 0
@@ -587,6 +611,7 @@ class AutomationIn(BaseModel):
     cron: str
     prompt: str
     enabled: bool = True
+    voice_trigger: Optional[str] = None
 
 
 class AutomationToggle(BaseModel):
@@ -644,7 +669,11 @@ async def api_list_automations():
 @app.post("/api/automations")
 async def api_create_automation(body: AutomationIn):
     return automations.create_automation(
-        name=body.name, cron=body.cron, prompt=body.prompt, enabled=body.enabled
+        name=body.name,
+        cron=body.cron,
+        prompt=body.prompt,
+        enabled=body.enabled,
+        voice_trigger=body.voice_trigger,
     )
 
 

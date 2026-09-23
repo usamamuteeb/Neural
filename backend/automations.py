@@ -1,14 +1,30 @@
 """
 Cron-style automations: scheduled background agent runs. Task definitions
-(name/cron/prompt/enabled/last_run/last_result) persist to a small JSON
-file so they survive restarts; APScheduler's AsyncIOScheduler handles the
-actual timing. Each run publishes its progress to the live activity feed
-(events.py) tagged with an "automation:<name>" source, so it shows up
-alongside interactive chat activity without being mistaken for it.
+(name/cron/prompt/enabled/voice_trigger/last_run/last_result) persist to
+a small JSON file so they survive restarts; APScheduler's
+AsyncIOScheduler handles the actual timing. Each run publishes its
+progress to the live activity feed (events.py) tagged with an
+"automation:<name>" source, so it shows up alongside interactive chat
+activity without being mistaken for it.
+
+Voice-triggered automations: an automation can optionally carry a
+voice_trigger phrase (e.g. "start my morning brief"). Saying (or typing)
+that phrase runs the automation directly -- see match_voice_trigger()
+below and its call site in main.py's ws_endpoint -- instead of going
+through a full conversational turn with the agent. This is deliberately
+a fast, deterministic path (a plain string match, no LLM call) rather
+than routing every message through the model to decide "is this a
+trigger phrase" first, which would add latency and an extra place for
+the model to get creative/wrong about something that should be exact.
+For a LESS exact phrasing ("hey, kick off my newsletter thing"), the
+agent itself has a separate run_automation_now tool below that it can
+call using its own judgment.
 """
 
+import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +88,55 @@ def list_automations() -> list[dict[str, Any]]:
     return sorted(out, key=lambda t: t.get("name", ""))
 
 
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_phrase(s: str) -> str:
+    # Lowercase, strip punctuation, and collapse whitespace, so a spoken
+    # "Start my Morning Brief!" (or an STT transcript with odd
+    # capitalization/stray punctuation) still matches a trigger phrase
+    # saved as plain text.
+    s = s.lower().strip()
+    s = _PUNCT_RE.sub("", s)
+    s = _SPACE_RE.sub(" ", s)
+    return s.strip()
+
+
+def match_voice_trigger(text: str) -> Optional[dict[str, Any]]:
+    # Return the (enabled) automation whose voice_trigger phrase matches
+    # this text, or None. Matching is normalized (case/punctuation-
+    # insensitive) and tolerant of trailing words -- an STT transcript
+    # often has filler or trailing noise ("start my morning brief
+    # please"), so a match requires the trigger phrase to appear at the
+    # very START of the utterance (exact match, or immediately followed
+    # by a word boundary), never merely mentioned somewhere inside a
+    # longer, unrelated sentence -- "start my morning briefing on today's
+    # news" should NOT fire a trigger phrase of "start my morning brief"
+    # followed by unrelated text with no word boundary between them.
+    #
+    # This intentionally also fires for typed text, not just voice -- the
+    # backend never distinguishes the two (see main.py's ws_endpoint),
+    # and there's no reason typing the exact trigger phrase shouldn't
+    # work too.
+    norm_text = _normalize_phrase(text)
+    if not norm_text:
+        return None
+    tasks = _load()
+    for task_id, task in tasks.items():
+        if not task.get("enabled"):
+            continue
+        trigger = (task.get("voice_trigger") or "").strip()
+        if not trigger:
+            continue
+        norm_trigger = _normalize_phrase(trigger)
+        if not norm_trigger:
+            continue
+        if norm_text == norm_trigger or norm_text.startswith(norm_trigger + " "):
+            return {**task, "id": task_id}
+    return None
+
+
 def _text(s: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": s}]}
 
@@ -80,11 +145,12 @@ def _text(s: str) -> dict[str, Any]:
     "list_automations",
     "The single source of truth for every automation (scheduled background task) "
     "actually configured on this machine right now -- name, cron schedule, the "
-    "prompt it runs, whether it's enabled, and when it last ran / will next run. "
-    "ALWAYS call this -- never a generic/unrelated cron or scheduler tool, and "
-    "never a guess from memory -- whenever the user asks what automations, "
-    "scheduled tasks, or routines exist, whether something specific (like a daily "
-    "weather briefing) is set up, or anything else about Neural's own schedule.",
+    "prompt it runs, whether it's enabled, its voice/text trigger phrase (if any), "
+    "and when it last ran / will next run. ALWAYS call this -- never a generic/"
+    "unrelated cron or scheduler tool, and never a guess from memory -- whenever "
+    "the user asks what automations, scheduled tasks, or routines exist, whether "
+    "something specific (like a daily weather briefing) is set up, what phrase "
+    "triggers one, or anything else about Neural's own schedule.",
     {},
 )
 async def list_automations_tool(args: dict) -> dict[str, Any]:
@@ -99,21 +165,67 @@ async def list_automations_tool(args: dict) -> dict[str, Any]:
         last_run = t.get("last_run") or "never run yet"
         cron = t.get("cron", "?")
         prompt = t.get("prompt", "?")
+        trigger = t.get("voice_trigger") or None
+        trigger_note = f", voice trigger: \"{trigger}\"" if trigger else ", no voice trigger set"
         lines.append(
             "- \"" + name + "\" (" + status + ") -- schedule: " + repr(cron)
-            + ", prompt: " + repr(prompt) + ", next run: " + str(next_run)
-            + ", last run: " + str(last_run)
+            + ", prompt: " + repr(prompt) + trigger_note
+            + ", next run: " + str(next_run) + ", last run: " + str(last_run)
         )
     return _text("Configured automations:\n" + "\n".join(lines))
 
 
-AUTOMATIONS_TOOLS = ["list_automations"]
+@tool(
+    "run_automation_now",
+    "Manually trigger one of the user's saved automations to run immediately, by "
+    "name -- for when the user asks you (in natural language, not necessarily the "
+    "exact configured voice/text trigger phrase -- e.g. \"kick off my newsletter "
+    "thing\") to run, start, or trigger one of their existing automations right "
+    "now. Look the name up with list_automations first if you're not sure of the "
+    "exact name -- this matches by exact name first, then falls back to a loose "
+    "substring match. This starts the run in the background and returns right "
+    "away -- the automation's own real output (and any errors) follows shortly "
+    "afterward as a normal chat message, spoken aloud, exactly like a scheduled "
+    "run would. Don't try to fulfill the automation's task yourself in this same "
+    "turn -- just confirm you're starting it.",
+    {"name": str},
+)
+async def run_automation_now_tool(args: dict) -> dict[str, Any]:
+    name = (args.get("name") or "").strip()
+    if not name:
+        return _text("Need the automation's name to run it.")
+    tasks = _load()
+    match_id = next(
+        (tid for tid, t in tasks.items() if (t.get("name") or "").strip().lower() == name.lower()),
+        None,
+    )
+    if not match_id:
+        # Loose fallback so "morning brief" still finds an automation
+        # literally named "Morning Briefing".
+        match_id = next(
+            (tid for tid, t in tasks.items() if name.lower() in (t.get("name") or "").strip().lower()),
+            None,
+        )
+    if not match_id:
+        return _text(f'No automation named "{name}" found. Use list_automations to see what exists.')
+    real_name = tasks[match_id]["name"]
+    asyncio.create_task(run_automation(match_id))
+    return _text(f'Started "{real_name}" -- its result will follow shortly as a normal message.')
+
+
+AUTOMATIONS_TOOLS = ["list_automations", "run_automation_now"]
 automations_server = create_sdk_mcp_server(
-    name="automations", version="1.0.0", tools=[list_automations_tool]
+    name="automations", version="1.0.0", tools=[list_automations_tool, run_automation_now_tool]
 )
 
 
-def create_automation(name: str, cron: str, prompt: str, enabled: bool = True) -> dict[str, Any]:
+def create_automation(
+    name: str,
+    cron: str,
+    prompt: str,
+    enabled: bool = True,
+    voice_trigger: Optional[str] = None,
+) -> dict[str, Any]:
     tasks = _load()
     task_id = uuid.uuid4().hex[:8]
     tasks[task_id] = {
@@ -121,6 +233,7 @@ def create_automation(name: str, cron: str, prompt: str, enabled: bool = True) -
         "cron": cron,
         "prompt": prompt,
         "enabled": enabled,
+        "voice_trigger": (voice_trigger or "").strip() or None,
         "last_run": None,
         "last_result": None,
     }
@@ -224,11 +337,13 @@ async def run_automation(task_id: str) -> None:
 
     # Deliver the actual result into the normal chat pipeline -- written
     # AND spoken, exactly like an interactive reply -- regardless of
-    # whether this run fired on its own cron schedule or was started
-    # manually from the UI's "run now" button. Lazy import: main.py
-    # imports this module at its own top level, so importing back at this
-    # module's top would be circular; by the time any run actually
-    # happens the app has finished starting and main is fully loaded.
+    # whether this run fired on its own cron schedule, was started
+    # manually from the UI's "run now" button, or was kicked off by a
+    # voice/text trigger phrase or the run_automation_now tool. Lazy
+    # import: main.py imports this module at its own top level, so
+    # importing back at this module's top would be circular; by the time
+    # any run actually happens the app has finished starting and main is
+    # fully loaded.
     from .main import deliver_assistant_message
 
     if error:

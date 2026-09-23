@@ -265,6 +265,43 @@ Audio gain stage on top of the `<audio>` element, ~2.5x). If it's still
 too quiet, `TTS_VOLUME_BOOST` in `frontend/app.js`'s `playAudio` section
 is the one number to raise.
 
+## Voice-triggered automations
+
+Any automation can have a trigger phrase attached to it. Say (with
+WAKE WORD on) or type that exact phrase and the automation runs
+immediately -- no need to wait for its schedule, and no need to describe
+what it does in your own words each time.
+
+**Setup:** in the automations panel, click **+ New** and fill in the
+optional **"Voice/text trigger phrase"** field alongside the name and
+prompt -- e.g. name "Morning Briefing", trigger phrase "start my morning
+brief". Leave it blank for an automation that should only run on its
+schedule or via the ▶ button.
+
+**How it actually works:** this is a plain string match, not the LLM
+deciding whether your message sounds like a trigger -- when a message
+(voice-transcribed or typed, the backend treats them identically) starts
+with the exact trigger phrase, ignoring case/punctuation and tolerating
+trailing words ("start my morning brief" matches "Start my morning
+brief, please!"), the automation runs right away and you get an instant
+"Starting your ... automation now" acknowledgment while it works in the
+background -- the automation's real output (or an error) follows shortly
+after as a normal spoken/written reply, exactly like a scheduled run. The
+match has to be at the START of what you said, not just mentioned
+somewhere in a longer sentence, so ordinary conversation that happens to
+contain similar words won't misfire it.
+
+**A looser natural-language option too:** if you don't say the exact
+phrase -- "hey, can you kick off my newsletter thing" -- the agent has
+its own `run_automation_now` tool and can start the right automation
+by name using its own judgment, rather than trying to redo the
+automation's task itself in that conversation.
+
+**Current limitation:** there's no way to edit an existing automation's
+trigger phrase (or its name/schedule/prompt) after creation -- only
+delete and recreate it. Fine for now given how rarely these change once
+set, but worth knowing before you go hunting for an edit button.
+
 ## Notifications
 
 Tap the **ALERTS** pill in the top bar once; your browser asks for
@@ -571,6 +608,10 @@ brand.
   (create/enable/disable/run-now/delete), backed by APScheduler, and
   queryable by the agent itself via `list_automations` so it can actually
   answer "what's automated" correctly.
+- Voice-triggered automations (see Voice-triggered automations above):
+  an optional trigger phrase per automation that runs it instantly by
+  voice or text, plus a `run_automation_now` tool for looser
+  natural-language requests.
 - Response style tuned for brevity by default, always spoken as short
   natural sentences now regardless of whether you typed or spoke.
 - Voice: every reply is always spoken (typed or mic input, no silent
