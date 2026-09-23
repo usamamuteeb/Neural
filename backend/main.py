@@ -806,7 +806,7 @@ async def api_config():
     return {"wake_phrase": config.WAKE_PHRASE}
 
 
-@app.get("/media/{token}")
+@app.api_route("/media/{token}", methods=["GET", "HEAD"])
 async def get_media(token: str):
     """Serves a file registered by the media_tools MCP tool, e.g. so
     Buffer's servers can fetch a local screen recording or generated

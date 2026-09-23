@@ -24,3 +24,8 @@ tutor_docs_cache.json
 
 # Stray local test artifacts
 test.mp3
+
+# Output redirected here when Neural restarts its own uvicorn process
+# from inside a live turn (e.g. after editing its own backend code) --
+# just that run's console output, not something to version.
+*.log
