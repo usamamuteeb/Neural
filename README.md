@@ -234,6 +234,20 @@ Chrome/Edge apply real echo cancellation and this held up in testing, but
 if it misfires for you, turn **WAKE WORD** off during playback or use the
 push-to-talk mic button instead.
 
+Cutoff happens the instant speech is *detected*, not once you've finished
+asking -- wake-word listening watches interim (not-yet-final) speech
+recognition results, and the moment one shows real content while Neural
+is speaking, it interrupts right then rather than waiting for you to stop
+talking and the browser to finalize a transcript first (that wait used to
+mean Neural kept right on talking for the full length of your interrupting
+question). It then keeps listening to that same utterance as normal and
+sends it once it finalizes -- there's no gap where the mic "isn't
+listening yet." The push-to-talk mic button gets the same treatment: the
+click itself interrupts immediately, before you've said anything. This
+applies identically in Chat and Tutor mode (same shared pipeline); it's
+most noticeable in Tutor mode simply because its spoken answers tend to
+run longer.
+
 **Voice engine**: `backend/tts.py` tries three tiers in order --
 1. **edge-tts** (primary, free) -- neural-quality voices via Microsoft
    Edge's "Read Aloud" backend, no signup, no API key. `pip install
@@ -615,6 +629,16 @@ forth never mixes the two conversations, and nothing said in one mode
 is visible to the other. It works the same way on mobile as on desktop
 -- same tabs, same side panel (which swaps from Automations to a
 Knowledge Base panel while in Tutor mode), same voice input/output.
+
+Switching modes is visually distinct on purpose, not just a label/tab
+change: Tutor mode re-tints the whole UI (orb, glow, borders, the active
+tab) to its own red/crimson palette instead of Chat's cyan-leaning one,
+and the page background shifts to a dark red to match -- both animate
+smoothly rather than snapping instantly (`--state-hue`/`--bg` transitions
+in `style.css`). The orb itself also plays a brief animated flourish (a
+scale bounce plus an outward ring pulse) at the exact moment you switch,
+so the transition reads as a deliberate designed moment rather than a
+plain color fade -- see `playModeSwitchAnimation()` in `app.js`.
 
 Three layers, in the order they're worth setting up:
 

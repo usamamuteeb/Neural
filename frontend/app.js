@@ -44,14 +44,32 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+// Hoisted up here (rather than down in the Mode: Chat / Tutor section
+// where it conceptually lives) because setState()/STATE_HUE below read
+// it on every call, including the very first setState() a few lines
+// down -- it has to exist before that runs.
+let currentMode = "chat";
+
 /* ---------------- State / orb ---------------- */
 
-const STATE_HUE = { idle: 190, listening: 45, thinking: 265, speaking: 150, offline: 200 };
+// Two full hue palettes, not just one -- Tutor mode gets its own
+// visual identity (a red/crimson family) instead of the same cyan/
+// amber/violet/green Chat uses, so the whole UI (orb, glow, buttons,
+// the active mode tab -- everything derives its color from
+// --state-hue, see style.css) shifts palette the instant you switch
+// modes, animated by --state-hue's existing registered-property
+// transition rather than snapping instantly.
+const STATE_HUE = {
+  chat: { idle: 190, listening: 45, thinking: 265, speaking: 150, offline: 200 },
+  tutor: { idle: 355, listening: 18, thinking: 330, speaking: 5, offline: 355 },
+};
 
 function setState(state, label) {
-  document.documentElement.style.setProperty("--state-hue", STATE_HUE[state] ?? STATE_HUE.idle);
+  const hues = STATE_HUE[currentMode] || STATE_HUE.chat;
+  const hue = hues[state];
+  document.documentElement.style.setProperty("--state-hue", hue ?? hues.idle);
   orb.classList.remove("thinking", "speaking", "listening");
-  if (state && STATE_HUE[state] !== undefined && state !== "idle" && state !== "offline") {
+  if (state && hue !== undefined && state !== "idle" && state !== "offline") {
     orb.classList.add(state);
   }
   coreState.textContent = label;
@@ -320,8 +338,9 @@ function tryPlayNextAutomationChunk() {
 // client this connection's messages go to and sends back that mode's
 // own chat history (see socket.onmessage's "history"/"reset" handling
 // below) so the visible chat log actually swaps over too, instead of
-// mixing both modes' messages in one scrollback.
-let currentMode = "chat";
+// mixing both modes' messages in one scrollback. (currentMode itself is
+// declared up in the State / orb section -- setState()'s STATE_HUE
+// lookup needs it before this section even runs.)
 
 function updateModeUI() {
   for (const tab of modeTabs.querySelectorAll(".mode-tab")) {
@@ -342,14 +361,24 @@ function switchMode(mode) {
   // Same "barge-in" treatment as sending a new message -- don't let the
   // OLD mode's reply keep talking/streaming into the just-switched-to
   // chat log.
-  if (isSpeaking || expectingAudio) socket.send(JSON.stringify({ type: "interrupt" }));
-  resetTurnAudio();
-  isSpeaking = false;
-  expectingAudio = false;
-  assistantDiv = null;
+  bargeIn();
   currentMode = mode;
   updateModeUI();
+  // Re-run setState under the NEW mode's palette (bargeIn() above just
+  // set idle/ONLINE using the OLD mode's hues) and play the orb's
+  // animated mode-switch flourish -- see style.css's .mode-switching.
+  setState("idle", "ONLINE");
+  playModeSwitchAnimation();
   socket.send(JSON.stringify({ type: "set_mode", mode }));
+}
+
+function playModeSwitchAnimation() {
+  // Restart the animation even if a switch happens again before the
+  // previous one finished -- remove the class, force a reflow, re-add.
+  orb.classList.remove("mode-switching");
+  void orb.offsetWidth;
+  orb.classList.add("mode-switching");
+  setTimeout(() => orb.classList.remove("mode-switching"), 900);
 }
 
 if (modeTabs) {
@@ -464,17 +493,38 @@ function connect() {
 
 connect();
 
+// Barge-in: a previous reply is still being generated or spoken, so stop
+// it -- tell the backend to actually stop that turn (not just mute its
+// audio locally), cut local playback immediately, and bump the turn
+// counter so any leftover events the old (now-abandoned) turn is still
+// sending arrive tagged with a stale turn_id and get dropped by
+// socket.onmessage rather than resuming playback or bleeding into
+// whatever comes next. Used both when a new message is actually ready to
+// send (sendMessage below) and, for voice, the instant speech is
+// DETECTED rather than once the whole interrupting question has finished
+// (see startContinuousListening's interim-result handling) -- waiting
+// for a full transcript first would mean Neural keeps talking for the
+// entire length of your question before it even notices you spoke.
+// Returns whether there was actually anything to interrupt.
+function bargeIn() {
+  if (!isSpeaking && !expectingAudio) return false;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "interrupt" }));
+  }
+  turnCounter += 1;
+  activeTurnId = turnCounter;
+  resetTurnAudio();
+  isSpeaking = false;
+  expectingAudio = false;
+  assistantDiv = null;
+  setState("idle", "ONLINE");
+  return true;
+}
+
 function sendMessage(text) {
   if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
 
-  // Barge-in: a previous reply is still being generated or spoken, so
-  // this new message supersedes it. Tell the backend to actually stop
-  // that turn (not just mute its audio locally) before starting the new
-  // one, and cut local playback immediately so there's no gap where two
-  // replies could overlap.
-  if (isSpeaking || expectingAudio) {
-    socket.send(JSON.stringify({ type: "interrupt" }));
-  }
+  bargeIn();
   turnCounter += 1;
   activeTurnId = turnCounter;
 
@@ -553,12 +603,29 @@ function startContinuousListening() {
   if (!SR || continuousRecognition) return;
   const rec = new SR();
   rec.continuous = true;
-  rec.interimResults = false;
+  // Interim (not-yet-final) results, on purpose: with interimResults
+  // false, the browser only tells us anything once the WHOLE
+  // interrupting question has finished and gone quiet, which means
+  // Neural keeps right on talking for the full length of your question
+  // before it even notices you spoke -- the "keeps speaking until it's
+  // done" complaint. Watching interim results instead means we can cut
+  // Neural off the moment speech is actually detected, and then just
+  // keep accumulating that same utterance until it finalizes.
+  rec.interimResults = true;
   rec.lang = "en-US";
+  let bargedInThisUtterance = false;
   rec.onresult = (event) => {
     for (let i = event.resultIndex; i < event.results.length; i++) {
-      if (!event.results[i].isFinal) continue;
-      handleWakeTranscript(event.results[i][0].transcript.trim());
+      const result = event.results[i];
+      const transcript = result[0].transcript.trim();
+      if (!bargedInThisUtterance && transcript.length >= 2 && (isSpeaking || expectingAudio)) {
+        bargedInThisUtterance = true;
+        bargeIn();
+        setState("listening", "LISTENING…");
+      }
+      if (!result.isFinal) continue;
+      bargedInThisUtterance = false;
+      handleWakeTranscript(transcript);
     }
   };
   rec.onerror = (e) => {
@@ -619,6 +686,11 @@ voiceToggle.addEventListener("click", () => {
 
 micBtn.addEventListener("click", () => {
   if (!SR || micBtn.classList.contains("recording")) return;
+  // Pressing the mic button is itself an unambiguous "let me talk"
+  // signal -- don't wait for a transcript to cut Neural off, do it the
+  // instant the button is pressed, same as the interim-result barge-in
+  // above does for hands-free wake-word listening.
+  bargeIn();
   const rec = new SR();
   rec.continuous = false;
   rec.interimResults = false;
