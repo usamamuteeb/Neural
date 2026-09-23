@@ -197,6 +197,16 @@ each process by hand. Two scripts fix that:
   Test it immediately without rebooting: `Start-ScheduledTask -TaskName
   'NeuralAutoStart'`. Undo it later with `Unregister-ScheduledTask
   -TaskName 'NeuralAutoStart'`.
+- **`stop_neural.ps1`** -- stops both processes without restarting them.
+  A manual stop stays stopped -- the login task only fires at your next
+  Windows sign-in, it isn't a watchdog that relaunches things mid-session.
+  To stop it auto-starting at your next login too, either
+  `Disable-ScheduledTask -TaskName 'NeuralAutoStart'` (pause, keep the
+  task) or `Unregister-ScheduledTask -TaskName 'NeuralAutoStart'` (remove
+  it for good).
+  ```
+  powershell -File stop_neural.ps1
+  ```
 
   This one-time setup step has to be run by you (or by asking Neural
   itself, since it has real command execution on this machine) directly
