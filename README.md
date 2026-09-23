@@ -190,10 +190,37 @@ can reach it, unlike a public tunnel) and free:
 `tailscale serve` is private to your tailnet by design -- fine for using
 Neural from your own phone, but Buffer's servers aren't on your tailnet,
 so it won't satisfy `PUBLIC_BASE_URL` for posting images/video (see Social
-posting below). If you want that too, run `tailscale funnel 8787` instead
-(same idea, but reachable from the public internet) and put the URL it
-gives you in `PUBLIC_BASE_URL`. Cloudflare Tunnel or ngrok are the
-alternatives if you'd rather not use Tailscale at all.
+posting below).
+
+**Do not run `tailscale funnel 8787` (or funnel/tunnel the main backend
+at all) to get that.** Funnel makes that URL reachable by anyone on the
+public internet, and `/ws` accepts any connection with zero
+authentication -- no login, no API key, nothing -- then runs full agent
+turns under `bypassPermissions`: arbitrary Bash, browser automation,
+Gmail/WhatsApp/Slack, Buffer posting, everything Neural can do, on this
+actual machine. Worse, Funnel provisions a real publicly-trusted TLS
+certificate the moment it's turned on, and that certificate is logged in
+public Certificate Transparency logs -- so the hostname isn't
+meaningfully secret just because it looks like a random subdomain;
+scanning CT logs for new certificates is a routine thing, not an
+exotic attack. Funneling port 8787 hands unauthenticated remote control
+of your machine and every connected account to whoever finds it.
+
+**Use `backend/public_media_server.py` instead** -- a second, minimal
+server that exposes only `/media/{token}` and nothing else (no `/ws`, no
+`/api/*`, no chat, no automations). Run it alongside the main server, on
+its own port:
+```
+uvicorn backend.public_media_server:app --port 8788
+```
+then `tailscale funnel 8788` (not 8787) and put that URL in
+`PUBLIC_BASE_URL`. The only thing exposed is random-token file lookups
+(`secrets.token_urlsafe(16)` -- 128 bits, not brute-forceable) that
+expire after 24h and were only ever meant to go public anyway -- that's
+the whole point of `local_file_to_public_url`. There's no meaningful new
+exposure from someone finding that URL, unlike the main backend.
+Cloudflare Tunnel or ngrok work the same way if you'd rather not use
+Tailscale -- point either one at 8788, never at 8787.
 
 ## Voice
 
@@ -953,3 +980,12 @@ smaller surface -- but note that setting `PERMISSION_MODE` back to
 `acceptEdits` or `default` will make any non-file-edit tool call (web
 search, Bash, browser actions) hang waiting for an approval this setup
 has no way to give.
+
+None of this has a login screen: `/ws` (the chat socket) accepts any
+connection with no authentication at all, and once connected it's this
+exact `bypassPermissions` access. That's fine as long as it's only
+reachable from this machine or your own tailnet (`tailscale serve`) --
+**never put the main backend (port 8787) on a public tunnel/Funnel**.
+See Mobile access above for why, and use `backend/public_media_server.py`
+instead for the one thing that actually needs a public URL (Buffer
+fetching media).
