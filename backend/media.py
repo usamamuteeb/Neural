@@ -95,7 +95,7 @@ async def local_file_to_public_url(args: dict) -> dict[str, Any]:
         "mime": mimetypes.guess_type(str(path))[0] or "application/octet-stream",
     }
     _save(reg)
-    return _text(f"{config.PUBLIC_BASE_URL}/media/{token}")
+    return _text(f"{config.PUBLIC_BASE_URL}/media/{token}{path.suffix.lower()}")
 
 
 MEDIA_TOOLS = ["local_file_to_public_url"]

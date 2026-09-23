@@ -813,7 +813,9 @@ async def get_media(token: str):
     image by URL (see backend/media.py -- Buffer attaches media by URL,
     not by upload). Files are exposed by random token, not by real path,
     and the token expires after 24h; this is not a general file server."""
-    path = media.resolve(token)
+    # Accept an optional file extension ("/media/<token>.mp4") -- some
+    # services (Buffer/YouTube) sniff the media type from the URL suffix.
+    path = media.resolve(token.rsplit(".", 1)[0] if "." in token else token)
     if not path:
         raise HTTPException(status_code=404, detail="not found or expired")
     return FileResponse(path)

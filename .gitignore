@@ -29,3 +29,4 @@ test.mp3
 # from inside a live turn (e.g. after editing its own backend code) --
 # just that run's console output, not something to version.
 *.log
+*.err
