@@ -1,27 +1,10 @@
-# Restarts Neural's backend after its own source has been edited -- by
-# Neural itself mid-conversation (it has Bash/PowerShell access and will
-# run this after patching its own code), or by you manually. Finds the
-# currently-running `uvicorn backend.main:app` process, stops it, and
-# starts a fresh one in the background with console output redirected to
-# backend_restart.log/.err (both gitignored) instead of a visible window.
+# DEPRECATED -- superseded by start_neural.ps1, which does everything this
+# script used to do (restart the main backend) plus the public media
+# server and Tailscale re-assertion, in one place. Kept only so older
+# notes/scripts that still reference "restart_backend.ps1" by name keep
+# working -- it just forwards to start_neural.ps1.
 #
-# Run from the project root:
-#   powershell -File restart_backend.ps1
-#
-# Safe to run even if no old process is running -- the Where-Object
-# filter just matches nothing and the Stop-Process step is skipped.
+# Use start_neural.ps1 directly for anything new.
 
-Get-CimInstance Win32_Process | Where-Object {
-    $_.CommandLine -match 'uvicorn' -and
-    $_.CommandLine -match 'backend.main:app' -and
-    $_.CommandLine -notmatch 'Get-CimInstance' -and
-    $_.Name -match 'uvicorn|python'
-} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-
-Start-Sleep 2
-
-Set-Location $PSScriptRoot
-Start-Process -WindowStyle Hidden -FilePath "$PSScriptRoot\backend\.venv\Scripts\uvicorn.exe" `
-    -ArgumentList 'backend.main:app', '--port', '8787' `
-    -RedirectStandardOutput "$PSScriptRoot\backend_restart.log" `
-    -RedirectStandardError "$PSScriptRoot\backend_restart.err"
+Write-Host "restart_backend.ps1 is deprecated -- forwarding to start_neural.ps1..."
+& (Join-Path $PSScriptRoot "start_neural.ps1") @args

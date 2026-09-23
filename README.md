@@ -151,9 +151,57 @@ below.
      as you would, Neural can see/do anything your own account can,
      including clicking poll options -- something a Bot API integration
      couldn't do.
-5. From the `Neural/` root: `uvicorn backend.main:app --port 8787`
-   (Don't use `--reload` on Windows -- its process supervision leaves the worker on the wrong asyncio event loop, which breaks the Agent SDK's ability to spawn the `claude` CLI subprocess at all, failing every connection with `CLIConnectionError`. Restart the server manually after code changes instead.)
+5. From the `Neural/` root, start everything with one command:
+   `powershell -File start_neural.ps1` -- this starts both the main
+   backend (port 8787) and the public media server (port 8788, see
+   Mobile access below), and safely stops/replaces any copies already
+   running first. (You can still run `uvicorn backend.main:app --port
+   8787` by hand if you only want the main backend and nothing else, but
+   the script is the easy path, especially after code changes -- see
+   "Restarting after changes / auto-start on reboot" right below.)
+   Don't use `--reload` on Windows -- its process supervision leaves the
+   worker on the wrong asyncio event loop, which breaks the Agent SDK's
+   ability to spawn the `claude` CLI subprocess at all, failing every
+   connection with `CLIConnectionError`.
 6. Open `http://localhost:8787` in a browser.
+
+### Restarting after changes / auto-start on reboot
+
+Every code change (yours or Neural's own self-edits) needs a restart to
+take effect, and previously that meant manually killing and re-launching
+each process by hand. Two scripts fix that:
+
+- **`start_neural.ps1`** -- run this any time to (re)start everything:
+  stops any already-running main backend and public media server
+  processes (matched by command line, so it's safe to run repeatedly --
+  no "port already in use" `WinError 10048`), starts fresh copies of
+  both, and re-asserts `tailscale serve 8787` / `tailscale funnel 8788`
+  if Tailscale is installed (harmless no-op if that's already set up --
+  see Mobile access below). Logs go to `neural_backend.log`/`.err` and
+  `neural_media.log`/`.err` in the project root (all gitignored).
+  ```
+  powershell -File start_neural.ps1
+  ```
+- **`setup_autostart.ps1`** -- a **one-time** script you run yourself,
+  once, in a real PowerShell window, that registers a Windows Task
+  Scheduler task ("NeuralAutoStart") triggered **at login**, which runs
+  `start_neural.ps1` automatically. After this, a laptop restart brings
+  everything back on its own the next time you log in -- no manual
+  restart needed. It's a logon trigger rather than a Windows Service on
+  purpose: WhatsApp/Slack automation needs a real interactive desktop
+  session, which a Service (running in an isolated SYSTEM session) does
+  not have.
+  ```
+  powershell -File setup_autostart.ps1
+  ```
+  Test it immediately without rebooting: `Start-ScheduledTask -TaskName
+  'NeuralAutoStart'`. Undo it later with `Unregister-ScheduledTask
+  -TaskName 'NeuralAutoStart'`.
+
+  This one-time setup step has to be run by you (or by asking Neural
+  itself, since it has real command execution on this machine) directly
+  in a PowerShell window on this PC -- it can't be done from a chat
+  session that only has file access to this repo.
 
 ## Mobile access
 
@@ -221,6 +269,11 @@ the whole point of `local_file_to_public_url`. There's no meaningful new
 exposure from someone finding that URL, unlike the main backend.
 Cloudflare Tunnel or ngrok work the same way if you'd rather not use
 Tailscale -- point either one at 8788, never at 8787.
+
+Once both are set up, you don't need to re-run either `tailscale serve`
+or `tailscale funnel` by hand again -- `start_neural.ps1` (see Setup
+above) re-asserts both every time it runs, including automatically after
+a reboot if you've set up `setup_autostart.ps1`.
 
 ## Voice
 
