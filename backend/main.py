@@ -57,76 +57,175 @@ logger = logging.getLogger("neural.main")
 
 app = FastAPI(title="Neural")
 
-# One shared agent connection for the whole app, not one per websocket.
+# One shared agent client per MODE ("chat" or "tutor"), not one per
+# websocket.
 #
 # Originally each /ws connection got its own ClaudeSDKClient from a
 # pre-warmed pool, so the agent's conversation context started fresh
 # every time -- which meant desktop and mobile (or even two tabs) felt
 # like talking to two different, disconnected instances of Neural with
-# no shared memory of what was just discussed. A single shared client
-# makes every device part of the same ongoing conversation, which is
-# what "the same Neural" should feel like regardless of which screen
-# you're using.
+# no shared memory of what was just discussed. A single shared client per
+# mode makes every device in that SAME mode part of the same ongoing
+# conversation, which is what "the same Neural" should feel like
+# regardless of which screen you're using -- while keeping chat and Tutor
+# mode's conversations, memory, and history completely separate from
+# each other (see backend/tutor.py's module docstring for why that
+# separation matters). Tutor's entry starts out None and stays that way
+# until the user actually opens Tutor mode -- unlike chat, it's not
+# pre-warmed at startup, since not every run of Neural will ever touch
+# it (see ws_endpoint's _handle_set_mode for where it's warmed instead).
 #
-# _chat_lock serializes actual turns (and connect/reconnect) so two
-# devices sending messages at the same moment can't interleave into the
-# same in-flight query -- the second one just waits its turn, same as if
-# one person were juggling two devices. Fine for a personal, single-user
-# assistant.
+# Each mode's own lock in _chat_locks serializes actual turns (and
+# connect/reconnect) within that mode so two devices sending messages to
+# the SAME mode at the same moment can't interleave into the same
+# in-flight query -- the second one just waits its turn, same as if one
+# person were juggling two devices. Fine for a personal, single-user
+# assistant. Chat and Tutor mode turns never block each other, since
+# they're different locks entirely.
 #
 # Spinning up a client is slow -- it boots the `claude` CLI as a
-# subprocess and launches the Playwright MCP server through npx, which
-# together took ~20 seconds when measured. That cost now lands once, at
-# server startup (kicked off in the background so it doesn't block
-# static-file/API serving), instead of on anyone's first message.
-_shared_client: "ClaudeSDKClient | None" = None
-_chat_lock = asyncio.Lock()
+# subprocess and (for chat mode) launches the Playwright MCP server
+# through npx, which together took ~20 seconds when measured. Chat
+# mode's cost lands once, at server startup (kicked off in the
+# background so it doesn't block static-file/API serving); Tutor mode's
+# lands once, the first time anyone opens Tutor mode.
+_shared_clients: dict[str, "ClaudeSDKClient | None"] = {"chat": None, "tutor": None}
+_chat_locks: dict[str, asyncio.Lock] = {"chat": asyncio.Lock(), "tutor": asyncio.Lock()}
+
+# How many currently-connected websocket tabs/devices have Tutor mode
+# open right now, across the whole app -- not per connection. This is
+# what defines a tutoring "session" boundary (see tutor.py's module
+# docstring): it only reaches 0 when EVERY device has left Tutor mode,
+# which is the moment _end_tutor_session below actually tears the shared
+# tutor client down (after asking it to summarize itself first) rather
+# than leaving a session other tabs are still using half-closed.
+_tutor_active_count = 0
 
 
-async def _warm_shared_client() -> None:
-    global _shared_client
-    async with _chat_lock:
-        if _shared_client is not None:
+async def _warm_shared_client(mode: str) -> None:
+    lock = _chat_locks[mode]
+    async with lock:
+        if _shared_clients[mode] is not None:
             return
         try:
-            client = new_client()
+            client = new_client(mode=mode)
             await client.connect()
-            _shared_client = client
+            _shared_clients[mode] = client
         except Exception as e:  # noqa: BLE001 -- warming is best effort
-            logger.error("Failed to pre-warm the shared agent client: %s", e)
+            logger.error("Failed to pre-warm the shared %s client: %s", mode, e)
 
 
-async def _run_turn(text: str):
-    """Run one chat turn on the shared client, serialized against every
-    other device/tab. Lazily (re)connects if the shared client doesn't
-    exist yet or died. Returns the async iterator of SDK messages for the
-    caller to stream to its own websocket."""
-    global _shared_client
-    async with _chat_lock:
-        if _shared_client is None:
-            _shared_client = new_client()
-            await _shared_client.connect()
+async def _run_turn(text: str, mode: str = "chat"):
+    """Run one chat turn on the shared client for this mode, serialized
+    against every other device/tab using the SAME mode (chat and tutor
+    turns never block each other -- separate locks). Lazily (re)connects
+    if that mode's shared client doesn't exist yet or died. Returns the
+    async iterator of SDK messages for the caller to stream to its own
+    websocket."""
+    lock = _chat_locks[mode]
+    async with lock:
+        client = _shared_clients[mode]
+        if client is None:
+            client = new_client(mode=mode)
+            await client.connect()
+            _shared_clients[mode] = client
         try:
-            await _shared_client.query(text)
+            await client.query(text)
         except Exception as e:
-            logger.error("Shared agent client query failed, reconnecting: %s", e)
+            logger.error("Shared %s client query failed, reconnecting: %s", mode, e)
             try:
-                await _shared_client.disconnect()
+                await client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
-            _shared_client = new_client()
-            await _shared_client.connect()
-            await _shared_client.query(text)
-        async for msg in _shared_client.receive_response():
+            client = new_client(mode=mode)
+            await client.connect()
+            _shared_clients[mode] = client
+            await client.query(text)
+        async for msg in client.receive_response():
             yield msg
 
 
-def _chat_history(limit: int = 40) -> list[dict]:
-    """Recent user/assistant chat turns from the shared EventBus history,
-    so a device that just opened the app (or reopened it) sees the same
-    recent conversation another device already had -- visual parity to
-    match the shared agent context above."""
-    return [e for e in bus.history() if e.get("type") == "message"][-limit:]
+def _chat_history(mode: str = "chat", limit: int = 40) -> list[dict]:
+    """Recent user/assistant turns from the shared EventBus history for
+    ONE mode, so a device that just opened the app (or just switched into
+    that mode) sees the same recent conversation another device already
+    had in that same mode -- visual parity to match the shared agent
+    context above. Messages are tagged with their mode when published
+    (see ws_endpoint and deliver_assistant_message below); anything
+    published before this existed has no "mode" key and is treated as
+    "chat" so old history isn't silently dropped.
+    """
+    return [
+        e
+        for e in bus.history()
+        if e.get("type") == "message" and e.get("mode", "chat") == mode
+    ][-limit:]
+
+
+async def _end_tutor_session() -> None:
+    """Runs once the LAST device/tab has left Tutor mode (see
+    ws_endpoint's set_mode handling and disconnect cleanup below): asks
+    the tutor's own shared client to summarize the session it just had
+    (see tutor.SESSION_END_INSTRUCTION) and save that summary + any
+    progress update via its own memory tools, then disconnects it and
+    clears _shared_clients["tutor"] so the NEXT time someone opens Tutor
+    mode, a fresh client is built with a fresh system prompt that reads
+    back exactly what was just saved (see tutor.build_tutor_system_prompt).
+
+    Debounced by a short sleep + a re-check of _tutor_active_count: if
+    the user left and immediately came back (a stray double-tap, or
+    switching modes twice in quick succession), the count will be back
+    above 0 by the time this actually runs, and it backs off entirely
+    rather than summarizing and tearing down a session the user is
+    already back in.
+    """
+    await asyncio.sleep(2.0)
+    if _tutor_active_count != 0:
+        return
+
+    lock = _chat_locks["tutor"]
+    async with lock:
+        if _tutor_active_count != 0:
+            return
+        client = _shared_clients["tutor"]
+        if client is None:
+            return
+        summary_text = ""
+        try:
+            from .tutor import SESSION_END_INSTRUCTION
+
+            await client.query(SESSION_END_INSTRUCTION)
+            async for msg in client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            summary_text += block.text
+        except Exception as e:  # noqa: BLE001 -- a failed summary shouldn't block closing the session
+            logger.error("Failed to summarize/close the tutor session: %s", e)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            _shared_clients["tutor"] = None
+
+    summary_text = summary_text.strip()
+    if summary_text:
+        # Written straight to history, not broadcast live -- by the time
+        # this fires, whoever ended the session has likely already
+        # switched away from Tutor mode locally, so there's no tutor chat
+        # log currently on screen to append it to. It'll show up as the
+        # last message the next time Tutor mode's history loads, which
+        # is exactly the continuity tutor.py's docstring describes.
+        bus.publish(
+            {
+                "type": "message",
+                "role": "assistant",
+                "text": summary_text,
+                "source": "tutor_session_end",
+                "mode": "tutor",
+            }
+        )
 
 
 # Every /ws connection registers its own _send(obj) here for as long as
@@ -145,7 +244,7 @@ async def _broadcast(obj: dict) -> None:
             pass
 
 
-async def deliver_assistant_message(text: str, source: str = "automation") -> None:
+async def deliver_assistant_message(text: str, source: str = "automation", mode: str = "chat") -> None:
     """Deliver a piece of assistant output that didn't come from an
     interactive /ws turn -- right now, only an automation's finished
     result (see automations.py's run_automation) -- through the exact
@@ -172,8 +271,8 @@ async def deliver_assistant_message(text: str, source: str = "automation") -> No
     if not text:
         return
 
-    bus.publish({"type": "message", "role": "assistant", "text": text, "source": source})
-    await _broadcast({"type": "automation_message", "text": text})
+    bus.publish({"type": "message", "role": "assistant", "text": text, "source": source, "mode": mode})
+    await _broadcast({"type": "automation_message", "text": text, "mode": mode})
 
     sentences, tail = _split_sentences(text)
     if tail.strip():
@@ -286,7 +385,12 @@ async def _notification_bridge() -> None:
 @app.on_event("startup")
 async def _on_startup() -> None:
     automations.start_scheduler()
-    asyncio.create_task(_warm_shared_client())
+    # Only chat mode is pre-warmed at startup -- Tutor mode's shared
+    # client is created lazily the first time someone actually opens
+    # Tutor mode (see ws_endpoint's set_mode handling), since not every
+    # run of Neural touches it and there's no reason to pay its ~20s
+    # subprocess-boot cost on every single startup regardless.
+    asyncio.create_task(_warm_shared_client("chat"))
     asyncio.create_task(_notification_bridge())
     # Visible proof at every boot that push is (or isn't) actually wired up
     # -- print this in your own terminal instead of guessing: 0 subscribed
@@ -321,11 +425,12 @@ async def _on_startup() -> None:
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
-    if _shared_client is not None:
-        try:
-            await _shared_client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+    for client in _shared_clients.values():
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 @app.middleware("http")
@@ -401,6 +506,15 @@ _DISCONNECTED = object()  # sentinel put on in_queue when the socket closes
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
 
+    # Which mode ("chat" or "tutor") THIS connection is currently
+    # showing -- distinct from _shared_clients' keys, which are the
+    # actual per-mode agent clients shared across every connection in
+    # that mode. Changed only via a {"type": "set_mode"} message (see
+    # _reader below); everything else in this function reads it fresh
+    # each turn so a mode switch mid-connection takes effect on the very
+    # next message with no reconnect needed.
+    conn_mode = "chat"
+
     # Every reply now always talks (not just when the mic was used to ask
     # it) and speaks AS the response is written, not after it's fully
     # generated: as assistant text streams in, complete sentences are
@@ -436,10 +550,14 @@ async def ws_endpoint(websocket: WebSocket):
     # mid-turn -- see its definition above.
     _broadcast_sinks.add(_send)
 
-    # Recent chat history from any device, so a newly (re)opened app looks
-    # like the same ongoing conversation instead of a blank slate -- see
-    # _chat_history()/the shared-client comment above.
-    await _send({"type": "history", "messages": _chat_history()})
+    # Recent chat history from any device IN THIS CONNECTION'S CURRENT
+    # MODE, so a newly (re)opened app looks like the same ongoing
+    # conversation instead of a blank slate -- see _chat_history()/the
+    # shared-client comment above. A fresh connection always starts in
+    # "chat" mode (see conn_mode above), so this is chat history; a later
+    # mode switch sends its own "history" event with "reset": true (see
+    # _handle_set_mode below) to swap the frontend's chat log over.
+    await _send({"type": "history", "mode": conn_mode, "messages": _chat_history(conn_mode)})
 
     # Incoming messages are read by their OWN dedicated task, not inline
     # in the main loop below. Without this, an "interrupt" sent while a
@@ -451,17 +569,53 @@ async def ws_endpoint(websocket: WebSocket):
     # it arrives, regardless of what the main loop is doing.
     in_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 
+    async def _handle_set_mode(new_mode: str) -> None:
+        """A tab/device switched between Chat and Tutor mode. Updates the
+        shared Tutor-session counter (see its definition above
+        _end_tutor_session) and, if this just emptied or just started
+        Tutor mode, kicks off the matching background lifecycle step --
+        then sends this connection a fresh, mode-scoped history so its
+        chat log can be swapped over without a full reconnect."""
+        nonlocal conn_mode
+        old_mode = conn_mode
+        if new_mode == old_mode:
+            return
+        conn_mode = new_mode
+
+        global _tutor_active_count
+        if old_mode == "tutor":
+            _tutor_active_count = max(0, _tutor_active_count - 1)
+            if _tutor_active_count == 0:
+                asyncio.create_task(_end_tutor_session())
+        if new_mode == "tutor":
+            _tutor_active_count += 1
+            if _shared_clients.get("tutor") is None:
+                # Pre-warm in the background so the user's first tutor
+                # message doesn't eat the ~20s client-boot cost -- same
+                # reasoning as chat mode's startup pre-warm, just
+                # triggered on demand instead of at app launch.
+                asyncio.create_task(_warm_shared_client("tutor"))
+
+        await _send({"type": "history", "mode": new_mode, "messages": _chat_history(new_mode), "reset": True})
+
     async def _reader() -> None:
         try:
             while True:
                 raw = await websocket.receive_text()
                 payload = json.loads(raw)
-                if payload.get("type") == "interrupt":
-                    if _shared_client is not None:
+                ptype = payload.get("type")
+                if ptype == "interrupt":
+                    client = _shared_clients.get(conn_mode)
+                    if client is not None:
                         try:
-                            await _shared_client.interrupt()
+                            await client.interrupt()
                         except Exception as e:
                             logger.error("interrupt() failed: %s", e)
+                    continue
+                if ptype == "set_mode":
+                    new_mode = payload.get("mode")
+                    if new_mode in ("chat", "tutor"):
+                        await _handle_set_mode(new_mode)
                     continue
                 await in_queue.put(payload)
         except WebSocketDisconnect:
@@ -481,13 +635,19 @@ async def ws_endpoint(websocket: WebSocket):
             text = payload.get("text", "")
             if not text:
                 continue
+            # Snapshot the mode for this one turn -- if the user switches
+            # modes again while this turn is still running, THIS turn
+            # still finishes against the mode it started in; the switch
+            # takes effect for the next message, same as conn_mode being
+            # read fresh each time through this loop already implies.
+            mode = conn_mode
             # Echoed back on every event this turn produces, so the
             # frontend can tell a barge-in's new turn apart from stray
             # leftover events a just-interrupted older turn is still
             # finishing up server-side -- see app.js's sendMessage.
             turn_id = payload.get("turn_id")
 
-            bus.publish({"type": "message", "role": "user", "text": text, "source": "chat"})
+            bus.publish({"type": "message", "role": "user", "text": text, "source": "chat", "mode": mode})
 
             # Voice-triggered automations: a saved automation can carry a
             # trigger phrase (set in the automation form), and saying (or
@@ -495,8 +655,13 @@ async def ws_endpoint(websocket: WebSocket):
             # through a full conversational turn with the agent -- a
             # fast, deterministic string match rather than an LLM call,
             # so it's instant and never misfires into a different
-            # interpretation. This is checked before anything else below,
-            # and short-circuits the rest of the loop body entirely: no
+            # interpretation. Checked regardless of mode (chat or tutor)
+            # since it's a fast intercept before any mode-specific
+            # dispatch -- automations themselves stay chat-scoped (see
+            # deliver_assistant_message's default mode="chat"), but
+            # saying a trigger phrase while in Tutor mode still fires it
+            # rather than being swallowed as a tutoring question. This
+            # short-circuits the rest of the loop body entirely: no
             # _run_turn, no per-sentence TTS for this message. The
             # matched automation's own real output (and any errors)
             # arrives shortly afterward through automations.run_automation
@@ -531,7 +696,7 @@ async def ws_endpoint(websocket: WebSocket):
                     out["data"] = None
                 await _send(out)
 
-            async for msg in _run_turn(wrap_for_voice(text)):
+            async for msg in _run_turn(wrap_for_voice(text, mode=mode), mode=mode):
                 event = _event_from_message(msg, text_buffer)
                 if event is None:
                     continue
@@ -558,7 +723,13 @@ async def ws_endpoint(websocket: WebSocket):
 
             if text_buffer:
                 bus.publish(
-                    {"type": "message", "role": "assistant", "text": "".join(text_buffer), "source": "chat"}
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "text": "".join(text_buffer),
+                        "source": "chat",
+                        "mode": mode,
+                    }
                 )
 
             if tts_tasks:
@@ -570,12 +741,21 @@ async def ws_endpoint(websocket: WebSocket):
             # of this.
             await _send({"type": "audio_done", "count": audio_seq, "turn_id": turn_id})
     finally:
-        # No client-disconnect here -- the agent client is shared across
-        # every device/tab, so one of them closing its socket must not
-        # tear down the conversation for the others (only actual app
-        # shutdown does that, see _on_shutdown above). Just stop this
-        # connection's own reader/writer.
+        # No client-disconnect here -- each mode's agent client is shared
+        # across every device/tab currently in that mode, so one
+        # connection closing must not tear down the conversation for the
+        # others (only actual app shutdown does that, see _on_shutdown
+        # above). If THIS connection was showing Tutor mode when it
+        # closed, though, it still counts as "leaving" Tutor mode for the
+        # session-boundary bookkeeping -- same as an explicit switch back
+        # to chat mode (see _handle_set_mode above), just via disconnect
+        # instead. Just stop this connection's own reader/writer.
         _broadcast_sinks.discard(_send)
+        if conn_mode == "tutor":
+            global _tutor_active_count
+            _tutor_active_count = max(0, _tutor_active_count - 1)
+            if _tutor_active_count == 0:
+                asyncio.create_task(_end_tutor_session())
         reader_task.cancel()
         writer_task.cancel()
         for task in (reader_task, writer_task):
@@ -693,6 +873,43 @@ async def api_toggle_automation(task_id: str, body: AutomationToggle):
 async def api_run_automation_now(task_id: str):
     asyncio.create_task(automations.run_automation(task_id))
     return {"started": True}
+
+
+class KBIngestIn(BaseModel):
+    path: str
+
+
+@app.get("/api/tutor/knowledge-base")
+async def api_kb_list():
+    """Every book/PDF currently ingested into Tutor mode's knowledge base
+    (see backend/knowledge_base.py) -- drives the Knowledge Base panel in
+    the UI's Tutor mode. Returns an empty list (not an error) if the
+    optional fastembed/pypdf/numpy dependencies aren't installed yet."""
+    from . import knowledge_base
+
+    return knowledge_base.list_sources()
+
+
+@app.post("/api/tutor/knowledge-base/ingest")
+async def api_kb_ingest(body: KBIngestIn):
+    """Ingest one file, or every .pdf/.txt/.md file directly inside one
+    folder, from THIS machine's filesystem -- see knowledge_base.py's
+    ingest_path. Runs synchronously (embedding a whole book can take a
+    little while); the UI shows an "Ingesting..." state while it waits."""
+    from . import knowledge_base
+
+    try:
+        return await knowledge_base.ingest_path(body.path)
+    except Exception as e:  # noqa: BLE001 -- surface the real reason to the UI rather than a bare 500
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/tutor/knowledge-base/{source_id}")
+async def api_kb_delete(source_id: str):
+    from . import knowledge_base
+
+    ok = knowledge_base.delete_source(source_id)
+    return {"deleted": ok}
 
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

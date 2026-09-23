@@ -231,6 +231,39 @@ button, input, select, textarea { font-family: inherit; }
   min-height: 0;
 }
 
+/* ---------------- Mode tabs (Chat / Tutor) ---------------- */
+
+.mode-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+
+.mode-tab {
+  flex: 1;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+
+.mode-tab:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.16); }
+
+.mode-tab.active {
+  color: hsl(var(--state-hue) 80% 72%);
+  border-color: hsl(var(--state-hue) 70% 45%);
+  background: hsla(var(--state-hue), 70%, 45%, 0.1);
+}
+
 #chat-log {
   flex: 1;
   overflow-y: auto;
@@ -559,6 +592,8 @@ button, input, select, textarea { font-family: inherit; }
   .stage { padding: 4px 16px calc(14px + env(safe-area-inset-bottom)); gap: 0; }
   .chat-col { flex: 1; min-height: 0; }
   .msg { max-width: 90%; font-size: 0.96rem; }
+  .mode-tabs { margin-bottom: 8px; }
+  .mode-tab { padding: 7px 10px; font-size: 0.7rem; }
 
   #chat-form { padding-top: 10px; gap: 8px; }
   .mic-btn, .send-btn { width: 44px; height: 44px; flex-shrink: 0; }

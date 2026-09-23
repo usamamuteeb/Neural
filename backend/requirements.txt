@@ -9,3 +9,14 @@ google-auth>=2.30
 google-auth-oauthlib>=1.2
 apscheduler>=3.10
 pywebpush>=2.0
+
+# Technical Tutor mode's knowledge base layer (backend/knowledge_base.py)
+# -- fully local, no API key: fastembed runs a small ONNX embedding
+# model on-device (no torch), pypdf extracts text from PDFs, numpy does
+# the cosine-similarity search. Optional: Tutor mode's other two layers
+# (docs cache, session memory) work fine without these; only
+# search_knowledge_base/list_knowledge_base_sources need them, and they
+# say so plainly if these aren't installed yet.
+fastembed
+pypdf
+numpy

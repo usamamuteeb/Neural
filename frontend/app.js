@@ -25,6 +25,19 @@ const closeModalBtn = document.getElementById("automation-modal-close");
 const cancelBtn = document.getElementById("automation-cancel");
 const automationForm = document.getElementById("automation-form");
 
+const modeTabs = document.getElementById("mode-tabs");
+const blockAutomations = document.getElementById("block-automations");
+const blockKnowledgeBase = document.getElementById("block-knowledge-base");
+
+const kbList = document.getElementById("kb-list");
+const kbModalBackdrop = document.getElementById("kb-modal-backdrop");
+const kbOpenModalBtn = document.getElementById("kb-open-modal");
+const kbModalClose = document.getElementById("kb-modal-close");
+const kbCancelBtn = document.getElementById("kb-cancel");
+const kbForm = document.getElementById("kb-form");
+const kbPathInput = document.getElementById("kb-path");
+const kbSubmitBtn = document.getElementById("kb-submit");
+
 function escapeHtml(s) {
   const div = document.createElement("div");
   div.textContent = String(s);
@@ -298,6 +311,55 @@ function tryPlayNextAutomationChunk() {
   automationAudioEl.onended = finish;
 }
 
+/* ---------------- Mode: Chat / Tutor ---------------- */
+// Tutor mode is a completely separate mode from normal chat -- its own
+// system prompt, its own memory, its own conversation on the backend
+// (see backend/main.py's mode-aware _shared_clients) -- not just a
+// different topic within the same chat. Switching tabs here tells the
+// backend via {"type": "set_mode"}, which swaps which shared agent
+// client this connection's messages go to and sends back that mode's
+// own chat history (see socket.onmessage's "history"/"reset" handling
+// below) so the visible chat log actually swaps over too, instead of
+// mixing both modes' messages in one scrollback.
+let currentMode = "chat";
+
+function updateModeUI() {
+  for (const tab of modeTabs.querySelectorAll(".mode-tab")) {
+    const active = tab.dataset.mode === currentMode;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  document.body.classList.toggle("mode-tutor", currentMode === "tutor");
+  chatInput.placeholder = currentMode === "tutor" ? "Ask your tutor…" : "Talk to Neural…";
+  if (blockAutomations) blockAutomations.hidden = currentMode === "tutor";
+  if (blockKnowledgeBase) blockKnowledgeBase.hidden = currentMode !== "tutor";
+  if (currentMode === "tutor") loadKnowledgeBase();
+}
+
+function switchMode(mode) {
+  if (mode === currentMode) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  // Same "barge-in" treatment as sending a new message -- don't let the
+  // OLD mode's reply keep talking/streaming into the just-switched-to
+  // chat log.
+  if (isSpeaking || expectingAudio) socket.send(JSON.stringify({ type: "interrupt" }));
+  resetTurnAudio();
+  isSpeaking = false;
+  expectingAudio = false;
+  assistantDiv = null;
+  currentMode = mode;
+  updateModeUI();
+  socket.send(JSON.stringify({ type: "set_mode", mode }));
+}
+
+if (modeTabs) {
+  modeTabs.addEventListener("click", (e) => {
+    const btn = e.target.closest(".mode-tab");
+    if (btn) switchMode(btn.dataset.mode);
+  });
+}
+updateModeUI();
+
 let socket;
 let assistantDiv = null;
 let historyLoaded = false; // only replay history once per page load, not on every reconnect
@@ -321,6 +383,16 @@ function connect() {
     const data = JSON.parse(event.data);
 
     if (data.type === "history") {
+      // A mode switch sends its own history with reset:true -- swap the
+      // visible chat log over entirely rather than appending, since this
+      // is a genuinely different conversation (see switchMode above).
+      if (data.reset) {
+        chatLog.innerHTML = "";
+        for (const m of data.messages || []) {
+          if (m.role === "user" || m.role === "assistant") addMessage(m.role, m.text);
+        }
+        return;
+      }
       // Recent chat from the shared conversation (any device) -- lets a
       // freshly opened tab/phone pick up right where another device left
       // off instead of starting blank. Only applied once per page load;
@@ -339,7 +411,16 @@ function connect() {
     // rides its own event types and its own playback pipeline above --
     // deliberately outside the turn_id system below, since it isn't part
     // of any interactive turn and must never be dropped or confused with
-    // one.
+    // one. Shown regardless of which mode (Chat/Tutor) is currently
+    // open -- an automation firing (including one just started by a
+    // trigger phrase typed/said while in Tutor mode, see main.py's
+    // voice-trigger interception) should never be silently swallowed
+    // just because the user happened to be looking at the other mode.
+    // It's still NOT saved into Tutor mode's own persisted history
+    // (automations are tagged mode="chat" server-side), so reopening
+    // Tutor mode later won't show a stray automation message that
+    // doesn't belong to that conversation -- this is just the live,
+    // in-the-moment notice.
     if (data.type === "automation_message") {
       addMessage("assistant", data.text);
       return;
@@ -796,6 +877,97 @@ async function loadAutomations() {
 }
 loadAutomations();
 setInterval(loadAutomations, 30000);
+
+/* ---------------- Knowledge Base (Tutor mode) ---------------- */
+// Layer 1 of Tutor mode's three-layer design (see backend/tutor.py) --
+// point it at a book/PDF already on this machine and it's chunked and
+// embedded locally (backend/knowledge_base.py) for the tutor to search
+// before answering. Mirrors the Automations panel's own modal pattern
+// above. Only loaded/shown while Tutor mode is active (see
+// updateModeUI); this can otherwise sit idle since it's a manual, no-
+// polling panel (unlike automations, nothing here changes on its own).
+
+function renderKnowledgeBase(items) {
+  if (!items.length) {
+    kbList.innerHTML = '<div class="empty-note">No books or PDFs added yet.</div>';
+    return;
+  }
+  kbList.innerHTML = "";
+  for (const s of items) {
+    const row = document.createElement("div");
+    row.className = "automation-row";
+    const added = s.added_at ? new Date(s.added_at).toLocaleDateString([], { month: "short", day: "numeric" }) : "—";
+    row.innerHTML =
+      '<div class="automation-row-top">' +
+      "<div>" +
+      '<div class="automation-name">' + escapeHtml(s.title) + "</div>" +
+      '<div class="automation-schedule">' + s.chunk_count + " chunks · added " + escapeHtml(added) + "</div>" +
+      "</div>" +
+      '<div class="automation-actions">' +
+      '<button class="icon-btn" data-action="delete" title="Remove">✕</button>' +
+      "</div></div>";
+
+    row.querySelector('[data-action="delete"]').addEventListener("click", () =>
+      fetch("/api/tutor/knowledge-base/" + s.id, { method: "DELETE" }).then(loadKnowledgeBase)
+    );
+
+    kbList.appendChild(row);
+  }
+}
+
+async function loadKnowledgeBase() {
+  try {
+    const res = await fetch("/api/tutor/knowledge-base");
+    renderKnowledgeBase(await res.json());
+  } catch (e) {
+    // server not ready; the panel just stays as it was
+  }
+}
+
+function openKbModal() {
+  kbModalBackdrop.hidden = false;
+}
+function closeKbModal() {
+  kbModalBackdrop.hidden = true;
+  kbForm.reset();
+  kbSubmitBtn.disabled = false;
+  kbSubmitBtn.textContent = "Ingest";
+}
+if (kbOpenModalBtn) {
+  kbOpenModalBtn.addEventListener("click", openKbModal);
+  kbModalClose.addEventListener("click", closeKbModal);
+  kbCancelBtn.addEventListener("click", closeKbModal);
+  kbModalBackdrop.addEventListener("click", (e) => { if (e.target === kbModalBackdrop) closeKbModal(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !kbModalBackdrop.hidden) closeKbModal(); });
+
+  kbForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const path = kbPathInput.value.trim();
+    if (!path) return;
+    kbSubmitBtn.disabled = true;
+    kbSubmitBtn.textContent = "Ingesting…";
+    try {
+      const res = await fetch("/api/tutor/knowledge-base/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        addMessage("system", "Couldn't add that to the knowledge base: " + (err.detail || res.statusText));
+        kbSubmitBtn.disabled = false;
+        kbSubmitBtn.textContent = "Ingest";
+        return;
+      }
+      closeKbModal();
+      loadKnowledgeBase();
+    } catch (e) {
+      addMessage("system", "Couldn't reach the server to ingest that path.");
+      kbSubmitBtn.disabled = false;
+      kbSubmitBtn.textContent = "Ingest";
+    }
+  });
+}
 
 /* ---------------- Mobile side drawer ---------------- */
 

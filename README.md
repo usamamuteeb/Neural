@@ -58,6 +58,17 @@ Architecture Plan" doc for the full design and open questions.
     it to find jobs. Off until you add your own `ADZUNA_APP_ID`/
     `ADZUNA_APP_KEY`. Covers a specific set of countries only -- see
     below.
+  - `tutor.py` / `tutor_memory.py` / `docs_cache.py` / `knowledge_base.py`
+    — Technical Tutor mode (see Technical Tutor mode below): a
+    completely separate mode with its own system prompt (`tutor.py`),
+    its own memory store under `Neural/tutor_memory/`
+    (`tutor_memory.py`), a cached-and-summarized docs fetcher backed by
+    `Neural/tutor_docs_cache.json` (`docs_cache.py`), and a local,
+    no-API-key book/PDF knowledge base backed by
+    `Neural/tutor_knowledge/kb.sqlite3` (`knowledge_base.py`, needs
+    `pip install fastembed pypdf numpy`). `main.py` keeps this mode's
+    shared agent client, lock, and chat history entirely separate from
+    normal chat's (see its module-level comments).
 - `frontend/` — a plain HTML/JS Progressive Web App, no build step: a chat
   column plus a side rail with a live Activity feed and an Automations
   panel, now including an ALERTS toggle for push notifications. On narrow
@@ -593,6 +604,76 @@ No setup needed for this -- it's driven entirely by Neural's existing
 memory tools (see the Layout section) the first time you brief it on a
 brand.
 
+## Technical Tutor mode
+
+A completely separate mode from normal chat -- its own system prompt,
+its own memory store, its own conversation on the backend -- for
+actually studying technical material (a language, a framework, a CS
+topic) rather than everyday assistant tasks. Switch to it with the
+**Tutor** tab above the chat box (next to **Chat**); switching back and
+forth never mixes the two conversations, and nothing said in one mode
+is visible to the other. It works the same way on mobile as on desktop
+-- same tabs, same side panel (which swaps from Automations to a
+Knowledge Base panel while in Tutor mode), same voice input/output.
+
+Three layers, in the order they're worth setting up:
+
+1. **Docs cache** (`backend/docs_cache.py`) -- the tutor's `fetch_doc_page`
+   tool fetches an official documentation page, summarizes it, and
+   caches that summary by URL. A later question about the same page
+   reuses the cache almost instantly instead of re-fetching; it
+   automatically re-fetches once the cache entry is older than
+   `TUTOR_DOCS_CACHE_DAYS` (14 by default -- change it in `.env`). No
+   setup, no API key -- it's just an HTTP fetch plus the existing cheap
+   Haiku utility tier for summarizing (see `backend/utility.py`).
+
+2. **Session memory** (`backend/tutor_memory.py` + `backend/tutor.py`) --
+   Tutor mode keeps its own memory files under `tutor_memory/`,
+   completely separate from normal chat's `memory/`. Two files matter
+   specifically: `progress.md` is a running record of what you've
+   actually mastered vs. what's still shaky, and `sessions.md` is a
+   dated log, one entry per session, of topics covered/weak spots/open
+   questions. A "session" is one continuous stretch in Tutor mode: when
+   every device leaves Tutor mode (switching back to Chat, or closing
+   the app), the tutor is asked to write a `sessions.md` entry and
+   update `progress.md` before its conversation closes; the next time
+   you open Tutor mode, a fresh conversation starts already primed with
+   the current `progress.md` and the last session's summary, so you
+   don't have to re-explain your level every time. No setup needed.
+
+3. **Knowledge base** (`backend/knowledge_base.py`) -- point it at a book
+   or PDF and the tutor grounds its answers in your own reference
+   material instead of general training alone. In Tutor mode's side
+   panel, click **+ Add** under Knowledge Base and give it a file path
+   (a single `.pdf`/`.txt`/`.md`) or a folder path (every supported file
+   directly inside it) -- Neural reads it straight from this machine,
+   chunks it, and embeds it **locally** (nothing is uploaded anywhere).
+   Needs one extra install: `pip install fastembed pypdf numpy`. The
+   first ingestion after that downloads a small local embedding model
+   (BAAI/bge-small-en-v1.5, ONNX, no torch, ~130MB, one-time). Without
+   that install, the other two layers still work fine -- the tutor's
+   `search_knowledge_base`/`list_knowledge_base_sources` tools just say
+   plainly that the knowledge base isn't set up yet instead of failing.
+
+Tutor mode's tool set is deliberately narrow -- the core file/terminal
+tools (Bash/Read/Write/Edit/Grep/Glob, genuinely useful for running
+example code) plus the three layers above, and nothing else: no Gmail,
+Buffer, WhatsApp/Slack, video editor, job search, stock footage, or
+automations tools. Saying a configured automation's voice/text trigger
+phrase still works even while in Tutor mode (see Voice-triggered
+automations above) -- that check happens before either mode's
+conversation ever sees the message -- but the tutor itself can't create,
+run, or ask about automations the way chat-mode Neural can.
+
+Voice works exactly the same way it does in normal chat -- same mic
+button, same wake-word listening, same TTS playback -- reusing the
+existing pipeline entirely rather than a new one, so it doesn't carry
+any new voice-specific risk. The one difference: chat mode's voice
+replies are kept to short, code-free spoken sentences by design, while
+Tutor mode's voice prefix allows full explanations and code in the text
+reply, asking the model to keep just the *spoken* portion in plain
+language and put any exact code in a short block after it.
+
 ## Working now
 
 - Real-time chat over the same small toolset Claude Code itself uses —
@@ -651,6 +732,11 @@ brand.
 - A responsive, mobile-usable UI: slide-over drawer for Activity/
   Automations, bottom-sheet automation modal, safe-area-aware layout,
   larger touch targets.
+- Technical Tutor mode (see Technical Tutor mode above): a fully
+  separate mode -- own system prompt, own memory, own conversation --
+  with a docs cache, session-summary/progress memory, and a local
+  (no-API-key) book/PDF knowledge base, switchable via the Chat/Tutor
+  tabs above the chat box, on desktop and mobile alike.
 
 ## Not yet built (tracked in the plan doc's Open Questions)
 
@@ -665,6 +751,11 @@ brand.
   driven with a real end-to-end prompt (trim/caption/color-grade an
   actual clip) -- only the underlying command was checked, not the tool
   in use
+- Technical Tutor mode's knowledge base layer (`fastembed`/`pypdf`) has
+  not been exercised with a real book/PDF end to end yet -- ingest one
+  and ask a question that should hit `search_knowledge_base` to confirm
+  chunking/embedding/retrieval actually behaves the way this was
+  designed to before relying on it
 
 ## Safety note
 

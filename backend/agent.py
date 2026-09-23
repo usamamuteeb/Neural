@@ -132,7 +132,50 @@ Response style: Be concise, raw, and completely direct. Skip all preambles, intr
 Tone: Natural, unfiltered, and highly competent. Speak like a blunt peer or a rogue terminal operator—never like a corporate bot, never formal, and never preachy. Prioritize absolute objectivity and speed over alignment padding."""
 
 
-def build_options(isolated: bool = False) -> ClaudeAgentOptions:
+def build_options(mode: str = "chat", isolated: bool = False) -> ClaudeAgentOptions:
+    if mode == "tutor":
+        return _build_tutor_options(isolated=isolated)
+    return _build_chat_options(isolated=isolated)
+
+
+def _build_tutor_options(isolated: bool = False) -> ClaudeAgentOptions:
+    """Technical Tutor mode's own, much narrower tool set -- see tutor.py's
+    module docstring for why this is deliberately NOT chat mode's
+    build_options with a different system prompt bolted on. No Gmail,
+    Buffer, WhatsApp/Slack, video editor, job search, stock footage, or
+    automations tools here; just the core file/terminal tools (genuinely
+    useful for a technical tutor to run example code) plus the three
+    tutor-specific tool groups."""
+    from .docs_cache import DOCS_CACHE_TOOLS, docs_cache_server
+    from .knowledge_base import KNOWLEDGE_BASE_TOOLS, knowledge_base_server
+    from .tutor import build_tutor_system_prompt
+    from .tutor_memory import TUTOR_MEMORY_TOOLS, tutor_memory_server
+
+    allowed = list(config.ALLOWED_TOOLS)
+    mcp_servers: dict = {
+        "tutor_memory": tutor_memory_server,
+        "tutor_docs": docs_cache_server,
+        "tutor_kb": knowledge_base_server,
+    }
+    allowed += [f"mcp__tutor_memory__{name}" for name in TUTOR_MEMORY_TOOLS]
+    allowed += [f"mcp__tutor_docs__{name}" for name in DOCS_CACHE_TOOLS]
+    allowed += [f"mcp__tutor_kb__{name}" for name in KNOWLEDGE_BASE_TOOLS]
+
+    kwargs = dict(
+        allowed_tools=allowed,
+        permission_mode=config.PERMISSION_MODE,
+        system_prompt=build_tutor_system_prompt(),
+        mcp_servers=mcp_servers,
+    )
+    if config.ANTHROPIC_MODEL:
+        kwargs["env"] = {"ANTHROPIC_MODEL": config.ANTHROPIC_MODEL}
+    if isolated:
+        kwargs["setting_sources"] = []
+        kwargs["disallowed_tools"] = list(kwargs.get("disallowed_tools") or []) + ["Skill", "Task"]
+    return ClaudeAgentOptions(**kwargs)
+
+
+def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
     # Lazy import: automations.py imports new_client from this module at
     # its own top level, so importing it back at agent.py's module top
     # would be a circular import at Python's import time. By the time
@@ -257,8 +300,8 @@ def build_options(isolated: bool = False) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(**kwargs)
 
 
-def new_client(isolated: bool = False) -> ClaudeSDKClient:
-    return ClaudeSDKClient(options=build_options(isolated=isolated))
+def new_client(mode: str = "chat", isolated: bool = False) -> ClaudeSDKClient:
+    return ClaudeSDKClient(options=build_options(mode=mode, isolated=isolated))
 
 
 # Prepended to the query text (not the system prompt) on every message --
@@ -279,8 +322,31 @@ VOICE_MODE_PREFIX = (
 )
 
 
-def wrap_for_voice(text: str) -> str:
-    return VOICE_MODE_PREFIX + text
+# Tutor mode's own voice prefix: chat mode's VOICE_MODE_PREFIX above bans
+# code/markdown outright, which is right for chat but too restrictive for
+# a technical tutor -- code IS the point, sometimes. Instead of trying to
+# programmatically strip spoken code out of a reply that's streamed and
+# spoken sentence-by-sentence as it's generated (fragile -- a fenced code
+# block can straddle several streamed chunks), this leans on the same
+# prompt-level steering VOICE_MODE_PREFIX already relies on successfully:
+# ask the model to keep the SPOKEN portion plain-language and put any
+# exact code in a short block afterward, same mechanism, different words.
+TUTOR_VOICE_MODE_PREFIX = (
+    "[Voice mode is on -- this reply will be spoken aloud via text-to-speech AND "
+    "shown as text in the chat log. Keep your explanation to 2-5 short, natural "
+    "spoken sentences in plain language -- no headers or bullet lists in that part. "
+    "If the answer needs actual code, a command, or an exact technical term, "
+    "describe it briefly in words in your spoken sentences (e.g. \"here's a for "
+    "loop over the list\") and put the precise code/command in a short fenced "
+    "block AFTER those sentences -- keep the spoken explanation understandable on "
+    "its own without needing that block read aloud. Still use your tools normally "
+    "if the question needs them.]\n\n"
+)
+
+
+def wrap_for_voice(text: str, mode: str = "chat") -> str:
+    prefix = TUTOR_VOICE_MODE_PREFIX if mode == "tutor" else VOICE_MODE_PREFIX
+    return prefix + text
 
 
 # Prepended to an automation's own prompt text when it's actually executed

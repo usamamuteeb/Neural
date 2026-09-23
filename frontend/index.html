@@ -53,6 +53,10 @@
     <main class="stage">
       <div class="side-backdrop" id="side-backdrop"></div>
       <section class="chat-col">
+        <div class="mode-tabs" id="mode-tabs" role="tablist" aria-label="Mode">
+          <button type="button" class="mode-tab active" data-mode="chat" role="tab" aria-selected="true">Chat</button>
+          <button type="button" class="mode-tab" data-mode="tutor" role="tab" aria-selected="false">Tutor</button>
+        </div>
         <div id="chat-log"></div>
         <form id="chat-form">
           <button type="button" id="mic-btn" class="mic-btn" title="Push to talk">
@@ -77,6 +81,14 @@
             <button id="automation-open-modal" class="pill small" type="button">+ New</button>
           </div>
           <div class="side-list scroll" id="automations-list"></div>
+        </div>
+
+        <div class="side-block" id="block-knowledge-base" hidden>
+          <div class="side-label">
+            KNOWLEDGE BASE
+            <button id="kb-open-modal" class="pill small" type="button">+ Add</button>
+          </div>
+          <div class="side-list scroll" id="kb-list"></div>
         </div>
       </aside>
     </main>
@@ -139,6 +151,23 @@
           </div>
         </form>
       </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="kb-modal-backdrop" hidden>
+    <div class="modal" id="kb-modal">
+      <div class="modal-head">
+        <h3>Add to Knowledge Base</h3>
+        <button type="button" id="kb-modal-close" class="icon-btn">✕</button>
+      </div>
+      <form id="kb-form">
+        <label>File or folder path on this machine<input id="kb-path" placeholder="C:\Users\HP\Documents\Books\python.pdf" autocomplete="off" /></label>
+        <p class="hint">A single .pdf/.txt/.md file, or a folder containing several -- Neural reads it directly from this machine, chunks it, and embeds it locally (nothing is uploaded anywhere). The first ingestion downloads a small local embedding model (one-time, about 130MB).</p>
+        <div class="modal-actions">
+          <button type="button" id="kb-cancel" class="pill">Cancel</button>
+          <button type="submit" id="kb-submit" class="pill primary">Ingest</button>
+        </div>
+      </form>
     </div>
   </div>
 

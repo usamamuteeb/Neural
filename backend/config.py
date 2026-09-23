@@ -63,6 +63,15 @@ PEXELS_ENABLED = bool(PEXELS_API_KEY)
 
 WAKE_PHRASE = os.getenv("WAKE_PHRASE", "Wake up")
 
+# Technical Tutor mode -- how many days a cached, summarized doc page
+# (see backend/docs_cache.py) is trusted before the next question about
+# it triggers a re-fetch. No API key/account of any kind needed for
+# Tutor mode's docs cache or session memory layers; the knowledge base
+# layer (backend/knowledge_base.py) needs `pip install fastembed pypdf
+# numpy` but also runs fully locally, no key either -- see that
+# module's docstring.
+TUTOR_DOCS_CACHE_DAYS = int(os.getenv("TUTOR_DOCS_CACHE_DAYS", "14"))
+
 # Empty string = let the Agent SDK pick its own default model.
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "")
 

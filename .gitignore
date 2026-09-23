@@ -12,6 +12,9 @@ media/
 memory/
 automations.json
 output/
+tutor_memory/
+tutor_knowledge/
+tutor_docs_cache.json
 
 # Playwright MCP's own trace/console/page-snapshot logs -- can contain
 # content from live browser sessions (WhatsApp/Slack/ChatGPT pages)
