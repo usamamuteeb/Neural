@@ -34,7 +34,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import automations, config, media, push, tts
+from . import automations, backup, config, media, push, tts
 from .agent import new_client, wrap_for_voice
 from .events import bus
 
@@ -385,6 +385,7 @@ async def _notification_bridge() -> None:
 @app.on_event("startup")
 async def _on_startup() -> None:
     automations.start_scheduler()
+    backup.schedule_backup()
     # Only chat mode is pre-warmed at startup -- Tutor mode's shared
     # client is created lazily the first time someone actually opens
     # Tutor mode (see ws_endpoint's set_mode handling), since not every

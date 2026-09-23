@@ -674,6 +674,133 @@ Tutor mode's voice prefix allows full explanations and code in the text
 reply, asking the model to keep just the *spoken* portion in plain
 language and put any exact code in a short block after it.
 
+## Personal CRM
+
+Lightweight contact notes -- one markdown file per person under
+`memory/people/<slug>.md`, in the same plain-file style as the rest of
+memory (see Layout). No setup, no separate database.
+
+- **Log an interaction:** just tell Neural about it in normal
+  conversation ("talked to Sarah today about the proposal") -- it calls
+  `crm_log_contact`, which updates that person's "Last contact" date and
+  appends a short note in one step.
+- **Standalone facts:** anything about a person that isn't tied to a
+  specific conversation ("Sarah's the one who introduced me to the
+  client", allergies, how you know them) goes through `crm_note` instead.
+- **Follow-ups:** say "remind me to follow up with Sarah about the
+  proposal" and Neural adds a checkbox item via `crm_add_followup`
+  (optionally with a due date); ask "what do I owe people" or "who do I
+  need to follow up with" and it scans every contact file and reports
+  what's open (`crm_list_followups`); tell it something's handled and it
+  checks the box (`crm_complete_followup`).
+- **Daily reminder:** the CRM tools themselves don't run on a schedule --
+  to get a proactive "here's what's outstanding" ping every morning,
+  create a normal automation from the Automations panel with a prompt
+  like `list my open CRM follow-ups` and a daily cron schedule. The
+  automation infrastructure (see Automations below) does the rest.
+
+Contact files live under `memory/`, so they're included in the daily
+memory backup automatically (see Memory backups below) with no extra
+wiring.
+
+## Meal planning / grocery lists
+
+Give Neural what's in your pantry and what you like, and it turns that
+into a plan and a shopping list -- no new backend module, just two more
+memory files plus normal chat.
+
+- The first time you ask for a meal plan, Neural will ask what's
+  currently in your pantry and any dietary preferences/dislikes, then
+  save the answers to `memory/food/pantry.md` and
+  `memory/food/preferences.md` so it doesn't ask again.
+- Ask for a plan ("plan my meals for the week") and it builds one around
+  what's already on hand first, respecting your saved preferences.
+- It follows up with a grocery list of just what's missing, grouped by
+  store section (produce, dairy, meat/protein, pantry, frozen, other) --
+  not a flat ingredient dump.
+- Tell it when you use something up or restock ("I'm out of eggs now",
+  "picked up more rice") and it updates `pantry.md` so the next plan
+  reflects reality.
+
+## Post-performance feedback loop
+
+Before suggesting new content for a brand you've posted for before,
+Neural can check how past posts on Buffer actually did, using Buffer's
+own analytics tools (`get_post` with `includeMetrics`, and
+`get_aggregated_post_metrics` for a rolled-up view across a date range
+and one or more channels) and fold what worked into its next
+suggestion, instead of posting blind every time.
+
+- Ask something like "how did last week's posts do" or "what should I
+  post next for `<brand>`, based on what's worked" and it pulls the
+  numbers and reasons about them in plain language (topic, format, time
+  of day, channel), not just a raw metrics dump.
+- What it learns gets saved to `memory/brand/<slug>-performance.md` so
+  the pattern persists across conversations instead of being
+  re-derived every time.
+- **Caveat, stated plainly:** this was implemented against Buffer's
+  official documented API (confirmed live via their own docs site, not
+  assumed), but has not yet been exercised end-to-end against a real
+  Buffer account's post history by me. Buffer's **free plan caps
+  analytics history at 30 days** -- a request for a wider window will
+  come back empty/truncated on free tier, which is a real platform
+  limit, not a bug. Paid Buffer tiers ($5-10/mo) remove that cap if you
+  need longer history.
+
+## Newsletter/podcast script generation
+
+Same content pipeline as social posts (brand kit, saved performance
+notes), different output shape -- also no new backend module, just a
+system-prompt addition reusing existing tools.
+
+- **Newsletter:** ask for one and Neural drafts it in the brand's voice
+  with a subject line, shows you the full draft, and only sends it via
+  `gmail_send` after you explicitly say go-ahead (same confirmation
+  rule as every other outbound message) -- or just hand you the draft
+  to paste elsewhere if you'd rather send it yourself.
+- **Podcast script:** structured as a cold open/hook, 2-4 main segments,
+  and a close/call-to-action, written to be read aloud. Once you
+  approve it, Neural synthesizes the actual episode audio with the same
+  free `edge-tts` engine used for voice chat and video narration, and
+  saves the result under `media/` -- you don't have to record it
+  yourself.
+
+## Memory backups
+
+`memory/`, `tutor_memory/`, `tutor_knowledge/`, `automations.json`,
+`tutor_docs_cache.json`, and `push_subscriptions.json` are all plain
+files deliberately kept OUT of the main git repo (see `.gitignore`) so
+personal facts/contacts/automations never end up somewhere that might
+get pushed. That also means they had no version history at all -- an
+accidental overwrite or a bad `memory_write` had nothing to fall back
+on. Fixed with a completely separate, **local-only** git repository at
+`.memory_backups/` (itself gitignored from the main repo) that mirrors
+just those files.
+
+- Runs automatically once a day (3:00 AM by default, on the same
+  APScheduler instance the Automations feature already uses -- see
+  `backend/backup.py`'s `schedule_backup()`), committing whatever
+  changed since the last run. Unchanged files cost nothing extra --
+  git dedups identical content, so daily commits of mostly-static files
+  stay cheap indefinitely.
+- On demand: ask Neural to "back up my memory now" (or just before you
+  ask it to do something that feels risky to your memory files, like a
+  bulk edit) and it calls `backup_now` directly instead of waiting for
+  the schedule.
+- To actually recover something: this is a normal git repo, so
+  `git log`/`git diff`/`git checkout <commit> -- <path>` inside
+  `.memory_backups/` works exactly like it would anywhere else -- open a
+  terminal there if you ever need to roll something back.
+- This is infrastructure, not a user-facing automation -- it
+  deliberately doesn't appear in the Automations panel or
+  `automations.json`, since it runs a plain Python/git operation, not
+  an agent prompt.
+- If `git` isn't on PATH at all, it falls back to a single
+  always-overwritten plain-copy snapshot at `.memory_backup_snapshot/`
+  instead of hard-failing -- no history, but still something. (Not a
+  concern on a machine that already has git installed, which yours
+  does.)
+
 ## Working now
 
 - Real-time chat over the same small toolset Claude Code itself uses —
@@ -737,6 +864,20 @@ language and put any exact code in a short block after it.
   with a docs cache, session-summary/progress memory, and a local
   (no-API-key) book/PDF knowledge base, switchable via the Chat/Tutor
   tabs above the chat box, on desktop and mobile alike.
+- Personal CRM (see Personal CRM above): contact notes, last-contact
+  tracking, and follow-up reminders backed by one markdown file per
+  person.
+- Meal planning / grocery lists (see above): weekly plans built around
+  your actual pantry and preferences, plus a shopping list grouped by
+  store section.
+- Post-performance feedback loop (see above): Buffer analytics
+  (`get_aggregated_post_metrics`) feeding into future content
+  suggestions instead of posting blind.
+- Newsletter/podcast script generation (see above): same brand-kit
+  pipeline as social posts, output as an email draft or a read-aloud
+  podcast script with synthesized episode audio.
+- Memory backups (see above): a daily local-only git snapshot of every
+  personal/runtime data file, plus an on-demand `backup_now` tool.
 
 ## Not yet built (tracked in the plan doc's Open Questions)
 
@@ -756,6 +897,16 @@ language and put any exact code in a short block after it.
   and ask a question that should hit `search_knowledge_base` to confirm
   chunking/embedding/retrieval actually behaves the way this was
   designed to before relying on it
+- Post-performance feedback loop's Buffer analytics tools
+  (`get_aggregated_post_metrics`, `get_post` with `includeMetrics`) are
+  wired up against Buffer's documented API but have not been driven
+  against a real Buffer account's post history end to end yet -- also
+  remember free-tier Buffer accounts only get 30 days of analytics
+  history
+- Memory backups' git-based path has not been exercised against a real
+  restore (`git checkout` pulling an old version back out of
+  `.memory_backups/`) yet -- the commit side has only been sanity-
+  checked by reading through `backend/backup.py`, not run live
 
 ## Safety note
 
