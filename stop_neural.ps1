@@ -18,7 +18,7 @@ function Stop-NeuralProcess($pattern) {
         $_.Name -match 'uvicorn|python'
     } | ForEach-Object {
         Write-Host "Stopping (PID $($_.ProcessId)): $($_.CommandLine)"
-        Stop-Process -Id $_.ProcessId -Force
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 }
 

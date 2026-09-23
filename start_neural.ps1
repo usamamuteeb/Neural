@@ -36,7 +36,12 @@ function Stop-NeuralProcess($pattern) {
         $_.Name -match 'uvicorn|python'
     } | ForEach-Object {
         Write-Host "Stopping existing process (PID $($_.ProcessId)): $($_.CommandLine)"
-        Stop-Process -Id $_.ProcessId -Force
+        # -ErrorAction SilentlyContinue: the CIM snapshot above can list a
+        # short-lived child process (e.g. a launcher's python.exe helper)
+        # that has already exited on its own by the time we get here --
+        # harmless, but Stop-Process would otherwise print a scary-looking
+        # (and misleading) red error for it.
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -77,8 +82,12 @@ if (-not $SkipTailscale) {
             }
         }
 
-        Invoke-TailscaleQuiet -CmdArgs @('serve', '8787')
-        Invoke-TailscaleQuiet -CmdArgs @('funnel', '8788')
+        # --bg is required here: without it, `tailscale funnel` (and, on
+        # some versions, `serve`) attaches to the foreground and blocks
+        # until Ctrl-C instead of applying the config and returning, which
+        # is exactly the hang the 20s timeout above was working around.
+        Invoke-TailscaleQuiet -CmdArgs @('serve', '--bg', '8787')
+        Invoke-TailscaleQuiet -CmdArgs @('funnel', '--bg', '8788')
     } else {
         Write-Host "Tailscale not found on PATH -- skipping serve/funnel setup. Install it or pass -SkipTailscale to silence this."
     }
