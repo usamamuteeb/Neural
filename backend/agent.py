@@ -214,10 +214,18 @@ def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
     allowed += [f"mcp__backup__{name}" for name in BACKUP_TOOLS]
 
     if config.BROWSER_SKILL_ENABLED:
+        # Pinned to an exact version, not @latest: with a pinned version npx
+        # can be satisfied entirely from its local cache once downloaded
+        # once, with zero network round-trip on every subsequent spawn.
+        # @latest instead makes npx hit the npm registry to resolve the
+        # current version on EVERY spawn (a new client/session included) --
+        # one slow/flaky registry response there was the real cause behind
+        # a live "Playwright server timed out on connecting" failure.
+        # Bump this string occasionally; it won't self-update anymore.
         mcp_servers["playwright"] = {
             "type": "stdio",
             "command": "npx",
-            "args": ["-y", "@playwright/mcp@latest"],
+            "args": ["-y", "@playwright/mcp@0.0.82"],
         }
         allowed += [f"mcp__playwright__{name}" for name in PLAYWRIGHT_TOOLS]
 
@@ -252,10 +260,13 @@ def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
         # (the one tool that would want a paid ElevenLabs/OpenAI key) is
         # deliberately excluded from VIDEO_EDITOR_TOOLS above, so it's never
         # allow-listed to begin with.
+        # Pinned for the same reason as Playwright above -- see that
+        # comment. This was previously unpinned (no version at all, which
+        # npx also resolves as "latest" on every spawn).
         mcp_servers["video_editor"] = {
             "type": "stdio",
             "command": "npx",
-            "args": ["-y", "@studiomeyer/mcp-video"],
+            "args": ["-y", "@studiomeyer/mcp-video@1.0.3"],
         }
         allowed += [f"mcp__video_editor__{name}" for name in VIDEO_EDITOR_TOOLS]
 
@@ -285,9 +296,10 @@ def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
         permission_mode=config.PERMISSION_MODE,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers=mcp_servers,
+        env={"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "120000"},
     )
     if config.ANTHROPIC_MODEL:
-        kwargs["env"] = {"ANTHROPIC_MODEL": config.ANTHROPIC_MODEL}
+        kwargs["env"]["ANTHROPIC_MODEL"] = config.ANTHROPIC_MODEL
 
     if isolated:
         # Used for automation runs (see automations.py). Root cause of a

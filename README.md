@@ -662,9 +662,9 @@ real posts. To turn it on:
 
 1. Make sure Node.js 18+ and `ffmpeg`/`ffprobe` are installed (both are
    already needed elsewhere in Neural, so most setups already have them).
-2. Test it runs standalone: `npx -y @studiomeyer/mcp-video` should start
-   without errors (Ctrl+C to stop) -- note the `@studiomeyer/` scope, a
-   plain `npx -y mcp-video` resolves to an unrelated package and fails
+2. Test it runs standalone: `npx -y @studiomeyer/mcp-video@1.0.3` should
+   start without errors (Ctrl+C to stop) -- note the `@studiomeyer/` scope,
+   a plain `npx -y mcp-video` resolves to an unrelated package and fails
    with "could not determine executable to run." It'll also need `npx
    playwright install chromium` the same way the browser skill does, if
    that hasn't already been run.
@@ -672,6 +672,16 @@ real posts. To turn it on:
 
 If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
 -- nothing else depends on it.
+
+**Both this and the Playwright browser skill are pinned to an exact npm
+version in `agent.py`, not `@latest`.** An unpinned version makes `npx`
+hit the npm registry to resolve "latest" on every single spawn (every new
+chat session, since a fresh client is created per connection) -- a slow
+or momentarily flaky registry response there was the real cause behind a
+live "Playwright server timed out on connecting" failure. A pinned exact
+version is served entirely from npx's local cache after the first
+download, no network round-trip needed. Bump the version string in
+`agent.py` yourself occasionally; it won't self-update anymore.
 
 **Caption styling is limited on purpose, not by oversight.** The
 caption/subtitle-burning modes only expose `fontSize`, `fontColor`,
