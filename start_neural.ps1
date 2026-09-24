@@ -86,8 +86,21 @@ if (-not $SkipTailscale) {
         # some versions, `serve`) attaches to the foreground and blocks
         # until Ctrl-C instead of applying the config and returning, which
         # is exactly the hang the 20s timeout above was working around.
+        #
+        # --https=8443 on the funnel line is NOT optional/cosmetic: both
+        # `serve` and `funnel` default to external port 443 on this same
+        # hostname when no port is given, and Tailscale only lets ONE
+        # mapping own port 443 per node -- confirmed live on this exact
+        # setup (the funnel command below, run second, silently took over
+        # port 443 from the serve line above it, so the main app became
+        # unreachable at the plain https://<hostname> URL and mobile
+        # access broke, even though nothing was ever publicly exposed).
+        # Putting funnel on 8443 instead (one of Funnel's only 3 allowed
+        # ports: 443/8443/10000) gives it its own slot so serve keeps 443
+        # for the main app. PUBLIC_BASE_URL (.env) must include :8443 to
+        # match -- see get_tailscale_url.ps1.
         Invoke-TailscaleQuiet -CmdArgs @('serve', '--bg', '8787')
-        Invoke-TailscaleQuiet -CmdArgs @('funnel', '--bg', '8788')
+        Invoke-TailscaleQuiet -CmdArgs @('funnel', '--bg', '--https=8443', '8788')
     } else {
         Write-Host "Tailscale not found on PATH -- skipping serve/funnel setup. Install it or pass -SkipTailscale to silence this."
     }

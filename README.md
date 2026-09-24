@@ -271,14 +271,34 @@ its own port:
 ```
 uvicorn backend.public_media_server:app --port 8788
 ```
-then `tailscale funnel 8788` (not 8787) and put that URL in
-`PUBLIC_BASE_URL`. The only thing exposed is random-token file lookups
+then `tailscale funnel --https=8443 8788` (not 8787) and put that URL,
+port included, in `PUBLIC_BASE_URL` (`https://<hostname>:8443/`). The
+only thing exposed is random-token file lookups
 (`secrets.token_urlsafe(16)` -- 128 bits, not brute-forceable) that
 expire after 24h and were only ever meant to go public anyway -- that's
 the whole point of `local_file_to_public_url`. There's no meaningful new
 exposure from someone finding that URL, unlike the main backend.
 Cloudflare Tunnel or ngrok work the same way if you'd rather not use
 Tailscale -- point either one at 8788, never at 8787.
+
+**The `--https=8443` isn't optional.** `tailscale serve 8787` (step 3
+above) and `tailscale funnel 8788` both default to external port 443 on
+this same hostname when you don't say otherwise -- and Tailscale only
+lets ONE mapping own port 443 per node. Run funnel plain (no `--https=`)
+right after serve and it silently steals port 443 away from it: the main
+app stops being reachable at the plain `https://<hostname>` URL (mobile
+access breaks) with no error telling you why, while Buffer's media link
+keeps working, since it's the one that ended up owning that slot. This
+was live and confirmed on this exact project (`get_tailscale_url.ps1`
+used to hand out one bare URL for both, which was wrong). Pinning funnel
+to 8443 instead -- one of Funnel's only 3 allowed external ports
+(443/8443/10000) -- gives it its own slot so serve keeps 443 for the main
+app; `get_tailscale_url.ps1` now prints the right URL for each. If
+mobile access to Neural itself is ever unreachable again while Buffer
+posting still works, this exact collision is the first thing to check
+(`tailscale serve status` shows the current mapping) -- `tailscale serve
+reset` clears it out completely if it's ever in a confusing state and
+you want to start both over clean.
 
 Once both are set up, you don't need to re-run either `tailscale serve`
 or `tailscale funnel` by hand again -- `start_neural.ps1` (see Setup
@@ -1005,6 +1025,23 @@ just those files.
   fallback available underneath if the primary voice ever has a bad day.
 - One shared conversation across every device/tab (desktop, phone, extra
   browser tabs) -- not a separate memory-less session per connection.
+- Conversation continuity across restarts: the actual agent session --
+  not just the visible chat log -- is checkpointed after every turn
+  (`backend/session_state.py`) and resumed automatically the next time
+  Neural starts, whether that's a manual restart or the self-healing
+  recovery below. Before this, any restart meant starting from zero with
+  no memory of what was just discussed, beyond whatever had already been
+  explicitly saved through the memory tools.
+- Self-healing from a wedged turn: chat and Tutor mode each share one
+  live agent session across every device, serialized so two devices
+  can't talk over each other -- but a stuck tool call or a `claude` CLI
+  subprocess that stopped responding without exiting used to hold that
+  lock forever, so Neural looked "online" (the websocket reconnects
+  fine) while never actually responding again until the whole backend
+  was restarted by hand. It now gives up on a turn that's produced
+  nothing for 5 minutes (`TURN_IDLE_TIMEOUT_SECONDS` in `.env`),
+  discards the wedged session, and picks back up fresh on your very
+  next message -- no restart needed.
 - Push notifications end-to-end: automation results (success or failure),
   real TTS/voice errors, and anything Neural itself decides to flag via
   `send_notification` -- reaches your phone/desktop even with the app

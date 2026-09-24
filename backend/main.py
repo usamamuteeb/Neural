@@ -34,7 +34,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import automations, backup, config, media, push, tts
+from . import automations, backup, config, media, push, session_state, tts
 from .agent import new_client, wrap_for_voice
 from .events import bus
 
@@ -102,17 +102,56 @@ _chat_locks: dict[str, asyncio.Lock] = {"chat": asyncio.Lock(), "tutor": asyncio
 _tutor_active_count = 0
 
 
+async def _new_client_resuming(mode: str) -> ClaudeSDKClient:
+    """Build and connect a client for `mode`, resuming its last known-good
+    session (see session_state.py) so a restart -- planned, or forced by
+    _run_turn's idle-timeout recovery below -- picks the SAME underlying
+    conversation back up instead of starting from zero. Falls back to a
+    brand-new session if the saved one can't be resumed (a deleted/
+    corrupted transcript, or any other reason the CLI rejects it) --
+    continuity is a nice-to-have, a working Neural isn't optional."""
+    saved = session_state.get_session_id(mode)
+    client = new_client(mode=mode, resume=saved)
+    try:
+        await client.connect()
+        return client
+    except Exception as e:
+        if not saved:
+            raise
+        logger.error(
+            "Couldn't resume %s's saved session %s (%s) -- starting a fresh session instead.",
+            mode, saved, e,
+        )
+        session_state.clear_session_id(mode)
+        client = new_client(mode=mode)
+        await client.connect()
+        return client
+
+
 async def _warm_shared_client(mode: str) -> None:
     lock = _chat_locks[mode]
     async with lock:
         if _shared_clients[mode] is not None:
             return
         try:
-            client = new_client(mode=mode)
-            await client.connect()
-            _shared_clients[mode] = client
+            _shared_clients[mode] = await _new_client_resuming(mode)
         except Exception as e:  # noqa: BLE001 -- warming is best effort
             logger.error("Failed to pre-warm the shared %s client: %s", mode, e)
+
+
+async def _iter_with_timeout(aiter, timeout: float):
+    """Wrap an async iterator so a stalled upstream can't block forever.
+    Used by _run_turn to bound how long it waits for the NEXT message
+    from an in-progress turn (see config.TURN_IDLE_TIMEOUT_SECONDS).
+    Raises asyncio.TimeoutError if nothing arrives within `timeout`
+    seconds of the previous item (or of starting)."""
+    it = aiter.__aiter__()
+    while True:
+        try:
+            item = await asyncio.wait_for(it.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            return
+        yield item
 
 
 async def _run_turn(text: str, mode: str = "chat"):
@@ -126,8 +165,7 @@ async def _run_turn(text: str, mode: str = "chat"):
     async with lock:
         client = _shared_clients[mode]
         if client is None:
-            client = new_client(mode=mode)
-            await client.connect()
+            client = await _new_client_resuming(mode)
             _shared_clients[mode] = client
         try:
             await client.query(text)
@@ -137,12 +175,37 @@ async def _run_turn(text: str, mode: str = "chat"):
                 await client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
-            client = new_client(mode=mode)
-            await client.connect()
+            client = await _new_client_resuming(mode)
             _shared_clients[mode] = client
             await client.query(text)
-        async for msg in client.receive_response():
-            yield msg
+
+        try:
+            async for msg in _iter_with_timeout(
+                client.receive_response(), config.TURN_IDLE_TIMEOUT_SECONDS
+            ):
+                if isinstance(msg, ResultMessage) and msg.session_id:
+                    # Only a turn that actually completed reaches here, so
+                    # this can never checkpoint a wedged/broken session --
+                    # see session_state.py.
+                    session_state.save_session_id(mode, msg.session_id)
+                yield msg
+        except asyncio.TimeoutError:
+            logger.error(
+                "%s produced no output for %ds mid-turn -- treating the session as "
+                "wedged (a stuck tool call, or a `claude` CLI subprocess that stopped "
+                "responding without exiting) and discarding it so the NEXT message "
+                "gets a working client instead of blocking on this same lock forever.",
+                mode, config.TURN_IDLE_TIMEOUT_SECONDS,
+            )
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            _shared_clients[mode] = None
+            raise RuntimeError(
+                "That took too long to respond, so I had to reset this session. "
+                "Please try again -- if it just spoke, that reply may have been cut short."
+            ) from None
 
 
 def _chat_history(mode: str = "chat", limit: int = 40) -> list[dict]:
@@ -195,7 +258,15 @@ async def _end_tutor_session() -> None:
             from .tutor import SESSION_END_INSTRUCTION
 
             await client.query(SESSION_END_INSTRUCTION)
-            async for msg in client.receive_response():
+            async for msg in _iter_with_timeout(
+                client.receive_response(), config.TURN_IDLE_TIMEOUT_SECONDS
+            ):
+                if isinstance(msg, ResultMessage) and msg.session_id:
+                    # Captured even though this client is about to be torn
+                    # down below -- so the NEXT time Tutor mode opens, its
+                    # fresh client can resume THIS conversation instead of
+                    # starting blank (see session_state.py).
+                    session_state.save_session_id("tutor", msg.session_id)
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
@@ -697,22 +768,40 @@ async def ws_endpoint(websocket: WebSocket):
                     out["data"] = None
                 await _send(out)
 
-            async for msg in _run_turn(wrap_for_voice(text, mode=mode), mode=mode):
-                event = _event_from_message(msg, text_buffer)
-                if event is None:
-                    continue
-                event["turn_id"] = turn_id
-                await _send(event)
-                if event["type"] == "assistant":
-                    for block in event["blocks"]:
-                        if block["kind"] == "text":
-                            speech_pending += block["text"]
-                    sentences, speech_pending = _split_sentences(speech_pending)
-                    for sentence in sentences:
-                        sentence = sentence.strip()
-                        if sentence:
-                            audio_seq += 1
-                            tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
+            try:
+                async for msg in _run_turn(wrap_for_voice(text, mode=mode), mode=mode):
+                    event = _event_from_message(msg, text_buffer)
+                    if event is None:
+                        continue
+                    event["turn_id"] = turn_id
+                    await _send(event)
+                    if event["type"] == "assistant":
+                        for block in event["blocks"]:
+                            if block["kind"] == "text":
+                                speech_pending += block["text"]
+                        sentences, speech_pending = _split_sentences(speech_pending)
+                        for sentence in sentences:
+                            sentence = sentence.strip()
+                            if sentence:
+                                audio_seq += 1
+                                tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
+            except Exception as e:
+                # A turn can fail outright rather than just produce a
+                # normal reply -- most notably _run_turn's own idle-timeout
+                # recovery (see there) discarding a wedged session, or the
+                # client failing to (re)connect at all. Surface it as an
+                # ordinary spoken reply through the SAME text_buffer/TTS
+                # pipeline below instead of leaving the user staring at
+                # silence, or letting an uncaught exception tear down this
+                # whole connection.
+                logger.error("Turn failed for mode %s: %s", mode, e)
+                error_text = str(e) or "Something went wrong on that turn -- please try again."
+                text_buffer.append(error_text)
+                await _send(
+                    {"type": "assistant", "blocks": [{"kind": "text", "text": error_text}], "turn_id": turn_id}
+                )
+                audio_seq += 1
+                tts_tasks.append(asyncio.create_task(_speak(error_text, audio_seq)))
 
             # Flush whatever's left in the buffer (a reply that doesn't
             # end on ./!/? -- common for short spoken replies) as the

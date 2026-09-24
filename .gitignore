@@ -11,6 +11,7 @@ media/
 # Personal/runtime state -- not meant to be versioned or shared
 memory/
 automations.json
+session_state.json
 output/
 tutor_memory/
 tutor_knowledge/

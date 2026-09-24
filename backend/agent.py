@@ -147,13 +147,17 @@ Response style: Be concise, raw, and completely direct. Skip all preambles, intr
 Tone: Natural, unfiltered, and highly competent. Speak like a blunt peer or a rogue terminal operator—never like a corporate bot, never formal, and never preachy. Prioritize absolute objectivity and speed over alignment padding."""
 
 
-def build_options(mode: str = "chat", isolated: bool = False) -> ClaudeAgentOptions:
+def build_options(
+    mode: str = "chat", isolated: bool = False, resume: str | None = None
+) -> ClaudeAgentOptions:
     if mode == "tutor":
-        return _build_tutor_options(isolated=isolated)
-    return _build_chat_options(isolated=isolated)
+        return _build_tutor_options(isolated=isolated, resume=resume)
+    return _build_chat_options(isolated=isolated, resume=resume)
 
 
-def _build_tutor_options(isolated: bool = False) -> ClaudeAgentOptions:
+def _build_tutor_options(
+    isolated: bool = False, resume: str | None = None
+) -> ClaudeAgentOptions:
     """Technical Tutor mode's own, much narrower tool set -- see tutor.py's
     module docstring for why this is deliberately NOT chat mode's
     build_options with a different system prompt bolted on. No Gmail,
@@ -184,13 +188,17 @@ def _build_tutor_options(isolated: bool = False) -> ClaudeAgentOptions:
     )
     if config.ANTHROPIC_MODEL:
         kwargs["env"] = {"ANTHROPIC_MODEL": config.ANTHROPIC_MODEL}
+    if resume:
+        kwargs["resume"] = resume
     if isolated:
         kwargs["setting_sources"] = []
         kwargs["disallowed_tools"] = list(kwargs.get("disallowed_tools") or []) + ["Skill", "Task"]
     return ClaudeAgentOptions(**kwargs)
 
 
-def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
+def _build_chat_options(
+    isolated: bool = False, resume: str | None = None
+) -> ClaudeAgentOptions:
     # Lazy import: automations.py imports new_client from this module at
     # its own top level, so importing it back at agent.py's module top
     # would be a circular import at Python's import time. By the time
@@ -302,6 +310,8 @@ def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
     )
     if config.ANTHROPIC_MODEL:
         kwargs["env"]["ANTHROPIC_MODEL"] = config.ANTHROPIC_MODEL
+    if resume:
+        kwargs["resume"] = resume
 
     if isolated:
         # Used for automation runs (see automations.py). Root cause of a
@@ -331,8 +341,18 @@ def _build_chat_options(isolated: bool = False) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(**kwargs)
 
 
-def new_client(mode: str = "chat", isolated: bool = False) -> ClaudeSDKClient:
-    return ClaudeSDKClient(options=build_options(mode=mode, isolated=isolated))
+def new_client(
+    mode: str = "chat", isolated: bool = False, resume: str | None = None
+) -> ClaudeSDKClient:
+    """resume: a saved session_id (see session_state.py) to continue an
+    existing conversation instead of starting a blank one -- used for the
+    two long-lived shared clients (chat, tutor) so a backend restart
+    picks the same conversation back up. Never pass this for isolated=True
+    automation runs, which are meant to be fresh, disconnected sessions
+    every time."""
+    return ClaudeSDKClient(
+        options=build_options(mode=mode, isolated=isolated, resume=resume)
+    )
 
 
 # Prepended to the query text (not the system prompt) on every message --

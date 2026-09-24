@@ -81,6 +81,18 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "")
 # why this replaces a wholesale swap to Haiku.
 UTILITY_MODEL = os.getenv("UTILITY_MODEL", "claude-haiku-4-5-20251001")
 
+# How long main.py's _run_turn will wait for the NEXT message from an
+# in-progress turn before deciding the underlying session is wedged (a
+# stuck tool call, or a `claude` CLI subprocess that stopped responding
+# without exiting) and discarding it. Chat/tutor use ONE shared client
+# across every device, serialized by a per-mode lock (see main.py) --
+# without a bound here, a single hang holds that lock forever and every
+# device is stuck until the whole backend is restarted by hand. 5
+# minutes is generous enough not to false-trigger on legitimately slow
+# tool calls (a video re-encode, a slow page load) while still making a
+# real hang self-heal instead of requiring a manual restart.
+TURN_IDLE_TIMEOUT_SECONDS = int(os.getenv("TURN_IDLE_TIMEOUT_SECONDS", "300"))
+
 # Claude-standard toolset only: a terminal plus file read/write/edit and
 # search. No task-specific tools — see the plan doc's "Tools & Skills
 # Philosophy" section for why.
