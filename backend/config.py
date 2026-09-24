@@ -93,6 +93,27 @@ UTILITY_MODEL = os.getenv("UTILITY_MODEL", "claude-haiku-4-5-20251001")
 # real hang self-heal instead of requiring a manual restart.
 TURN_IDLE_TIMEOUT_SECONDS = int(os.getenv("TURN_IDLE_TIMEOUT_SECONDS", "300"))
 
+# How old a saved chat/tutor session_id (see session_state.py) can be
+# before it stops getting resumed and main.py starts a fresh conversation
+# instead. Exists specifically to stop unbounded usage growth: "resume"
+# doesn't mean the server remembers your history for free -- the `claude`
+# CLI reconstructs and resends the ENTIRE prior conversation as input
+# context on every single turn. Left uncapped, that conversation only
+# ever grows, and since prompt caching's default TTL is 5 minutes, a
+# personal assistant used in bursts throughout the day (not continuously)
+# almost never gets a cache hit on that replay -- every turn, however
+# small, pays full price to reprocess an ever-larger transcript, forever.
+# This is what actually explained a user seeing ~17% of a 5-hour usage
+# window burned by two small memory-search requests.
+# 4 hours: long enough that a crash-and-quick-restart -- the original
+# problem session_state.py was built to fix -- still keeps its context;
+# short enough that a conversation realistically resets about once a day
+# instead of growing for weeks. memory_write/memory_read remain the right
+# place for anything that needs to survive past this cap.
+SESSION_RESUME_MAX_AGE_SECONDS = int(
+    os.getenv("SESSION_RESUME_MAX_AGE_SECONDS", str(4 * 60 * 60))
+)
+
 # Claude-standard toolset only: a terminal plus file read/write/edit and
 # search. No task-specific tools — see the plan doc's "Tools & Skills
 # Philosophy" section for why.
