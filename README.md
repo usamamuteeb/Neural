@@ -603,6 +603,36 @@ results. Free tier is capped at a few hundred calls/day -- check your own
 developer.adzuna.com dashboard for the current number rather than
 trusting a remembered figure here.
 
+## Resume writing (ATS-compliant)
+
+Ask Neural to write, update, or tailor a resume/CV -- from scratch, from
+what it already knows about your background, or targeted at a specific
+job posting (pairs naturally with Job search above: find a role, then ask
+it to tailor your resume to that exact listing). This is a skill
+(`.claude/skills/ats-resume/`), not a bolted-on tool -- Neural reads its
+instructions the first time it's relevant and follows them from there, no
+`ATS_RESUME_ENABLED`-style flag to turn on.
+
+It's built around one rule: most resumes get rejected by the Applicant
+Tracking System before a human ever sees them, purely on **format** --
+multi-column layouts, tables, text boxes, and headers/footers commonly
+get scrambled or silently dropped by ATS parsers, regardless of how good
+the content is. So the skill always produces a single-column `.docx` with
+standard section headings (Summary, Skills, Experience, Education,
+Certifications), reverse-chronological history, a standard font, and
+contact info in the document body (never a header/footer) -- built with
+`python-docx` via a ready-made script in the skill folder
+(`.claude/skills/ats-resume/scripts/build_ats_resume.py`), not hand-rolled
+each time. Run `pip install -r backend/requirements.txt` once after
+pulling this change (`python-docx` was just added) before asking for a
+resume.
+
+The first time you ask, it'll ask for your work history, education, and
+skills, then save that to `memory/career.md` so it doesn't have to ask
+again -- later requests (including tailoring to a new job posting) reuse
+that and just adjust emphasis/keywords to match the posting's own
+language, never inventing skills or experience you don't have.
+
 ## Video editing (mcp-video)
 
 Beyond the plain `ffmpeg` screen recording described above, Neural can use
@@ -642,6 +672,20 @@ real posts. To turn it on:
 
 If this proves flaky in daily use, set `VIDEO_EDITOR_ENABLED=false` again
 -- nothing else depends on it.
+
+**Caption styling is limited on purpose, not by oversight.** The
+caption/subtitle-burning modes only expose `fontSize`, `fontColor`,
+`outlineColor`, `outlineWidth`, and `position` (bottom/top/center) --
+there's no font-family choice and no background box; that's the full
+extent of what mcp-video's `video_text` tool supports, confirmed against
+its own source. The tool's raw defaults (`fontSize` 24-28) are sized for
+arbitrary video, not vertical shorts, which is why early captions came
+out small and hard to read. Neural's system prompt now tells it to
+explicitly pass a larger `fontSize` (~48-56 for 1080x1920 shorts/Reels/
+TikTok, low-to-mid 30s for landscape) with a white fill and a thick black
+outline for contrast, instead of relying on the tool's own small
+defaults -- ask it to go bigger/smaller/change the outline if a
+particular clip still doesn't read well.
 
 ## Stock footage (Pexels)
 

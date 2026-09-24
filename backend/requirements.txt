@@ -20,3 +20,8 @@ pywebpush>=2.0
 fastembed
 pypdf
 numpy
+
+# ATS resume-writing skill (.claude/skills/ats-resume/) -- builds a
+# single-column, ATS-safe .docx from structured data. No other project
+# code depends on this; only that skill's build_ats_resume.py script does.
+python-docx>=1.1
