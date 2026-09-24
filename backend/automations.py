@@ -226,6 +226,22 @@ def create_automation(
     enabled: bool = True,
     voice_trigger: Optional[str] = None,
 ) -> dict[str, Any]:
+    # Validate the cron string BEFORE touching disk. Found live: this used
+    # to save first and schedule second, so a malformed cron (e.g. "000"
+    # typed into the automations UI, saved as a single automation called
+    # "closeup") got persisted to automations.json even though scheduling
+    # it failed and the create request itself errored out. That one bad
+    # entry then sat there enabled, harmless-looking, until the NEXT full
+    # restart -- when start_scheduler() below tried to reschedule every
+    # saved automation and crashed the ENTIRE backend on this one bad
+    # cron, taking down every other automation and the whole app with it.
+    # Rejecting it here, before _save(), means a bad cron never reaches
+    # disk at all -- the request just fails cleanly (see main.py's 400).
+    if enabled:
+        try:
+            CronTrigger.from_crontab(cron)
+        except ValueError as exc:
+            raise ValueError(f"Invalid cron schedule {cron!r}: {exc}") from exc
     tasks = _load()
     task_id = uuid.uuid4().hex[:8]
     tasks[task_id] = {
@@ -258,6 +274,15 @@ def toggle_automation(task_id: str, enabled: bool) -> Optional[dict[str, Any]]:
     tasks = _load()
     if task_id not in tasks:
         return None
+    if enabled:
+        # Same validation as create_automation -- an automation whose cron
+        # was already broken (or went stale/invalid some other way)
+        # shouldn't be re-enabled and re-persisted without catching that
+        # here too.
+        try:
+            CronTrigger.from_crontab(tasks[task_id]["cron"])
+        except ValueError as exc:
+            raise ValueError(f"Invalid cron schedule {tasks[task_id]['cron']!r}: {exc}") from exc
     tasks[task_id]["enabled"] = enabled
     _save(tasks)
     if enabled:
@@ -358,10 +383,42 @@ async def run_automation(task_id: str) -> None:
 
 def start_scheduler() -> None:
     """Load persisted tasks, schedule the enabled ones, and start the
-    scheduler. Call once at app startup."""
+    scheduler. Call once at app startup.
+
+    Found live: this used to call _schedule() for every enabled task with
+    no error handling, so ONE automation with a malformed cron string (an
+    automation named "closeup" got saved with cron="000" -- see
+    create_automation's own validation, added after this) raised straight
+    out of this loop. That exception propagated out of FastAPI's startup
+    lifespan handler and crashed the ENTIRE backend -- "Application
+    startup failed. Exiting." -- meaning one bad automation took down
+    every other automation, chat, and the whole app, every single time it
+    tried to restart, with the terminal's "== Done ==" line printing
+    regardless (start_neural.ps1 doesn't check whether uvicorn's app
+    startup actually succeeded, just that the process launched).
+
+    Now each task is scheduled independently: a bad one is logged and
+    flipped to disabled (so the UI honestly shows it as off instead of
+    silently no-op'ing while still claiming "enabled") rather than taking
+    the rest of the app down with it. Fix the automation's schedule in the
+    UI and re-enable it once it's valid again.
+    """
     tasks = _load()
+    changed = False
     for task_id, task in tasks.items():
-        if task.get("enabled"):
+        if not task.get("enabled"):
+            continue
+        try:
             _schedule(task_id, task)
+        except Exception as exc:  # noqa: BLE001 -- one bad automation must never take the whole backend down
+            logger.error(
+                'Automation "%s" (id %s) has an invalid schedule (%r) and has been '
+                "disabled -- fix its cron in the automations UI and re-enable it: %s",
+                task.get("name", "?"), task_id, task.get("cron"), exc,
+            )
+            task["enabled"] = False
+            changed = True
+    if changed:
+        _save(tasks)
     if not scheduler.running:
         scheduler.start()

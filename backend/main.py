@@ -940,13 +940,22 @@ async def api_list_automations():
 
 @app.post("/api/automations")
 async def api_create_automation(body: AutomationIn):
-    return automations.create_automation(
-        name=body.name,
-        cron=body.cron,
-        prompt=body.prompt,
-        enabled=body.enabled,
-        voice_trigger=body.voice_trigger,
-    )
+    # create_automation raises ValueError on an unparseable cron string --
+    # see its own docstring for the live bug this closes (a bad cron used
+    # to get saved anyway and crash the ENTIRE backend on the next
+    # restart). Surface it as a clean 400 instead of an unhandled 500 so
+    # the UI can actually show the user what's wrong with the schedule
+    # they typed.
+    try:
+        return automations.create_automation(
+            name=body.name,
+            cron=body.cron,
+            prompt=body.prompt,
+            enabled=body.enabled,
+            voice_trigger=body.voice_trigger,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/automations/{task_id}")
@@ -957,7 +966,10 @@ async def api_delete_automation(task_id: str):
 
 @app.post("/api/automations/{task_id}/toggle")
 async def api_toggle_automation(task_id: str, body: AutomationToggle):
-    result = automations.toggle_automation(task_id, body.enabled)
+    try:
+        result = automations.toggle_automation(task_id, body.enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result or {"error": "not found"}
 
 
