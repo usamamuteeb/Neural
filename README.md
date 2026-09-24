@@ -285,6 +285,8 @@ or `tailscale funnel` by hand again -- `start_neural.ps1` (see Setup
 above) re-asserts both every time it runs, including automatically after
 a reboot if you've set up `setup_autostart.ps1`.
 
+**Known limitation: Funnel media fetch reliability.** Tailscale's own docs say plainly that traffic sent over a Funnel "is subject to non-configurable bandwidth limits" -- there's no setting to raise it. In practice this can show up as Buffer intermittently failing to fetch a video you just posted a link to, even though the file is completely fine (correct H.264/AAC, well under Buffer's size limits, and the exact same link Neural's own requests fetch successfully). The fetch just doesn't complete reliably every time over the funnel path -- it's not deterministic and isn't tied to file size in any simple way (an 18MB file can succeed while a 10MB one from the same batch fails). If it happens, the fix is patience, not a smaller file -- Neural retries the same link a couple of times before giving up, and if it's still failing you can just ask again in a few minutes or let it go out at its next scheduled slot. If this becomes a frequent problem, the real fix would be swapping Funnel for a proper CDN/object-storage host for outbound media (so Buffer fetches from there instead of from this PC's own home connection) -- worth considering if repeated failures get annoying, but not something set up by default.
+
 ## Voice
 
 **Every reply is spoken, always** -- not just ones sent from the mic. Typing
@@ -560,6 +562,10 @@ Known platform caveats, not Neural bugs:
   access, and Neural will tell you if that's what happened.
 - **YouTube**: Buffer supports YouTube Shorts, not regular long-form video
   uploads.
+- **Intermittent video fetch failures** ("video could not be read from its
+  URL" or similar): this is Buffer's servers failing to pull your media over
+  the Tailscale Funnel link, not a bad file -- see Mobile access above for why,
+  and how Neural handles it (retry the same link first, don't re-encode).
 
 ## Job search (Adzuna)
 
