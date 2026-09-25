@@ -72,6 +72,34 @@ VIDEO_EDITOR_TOOLS = [
     "video_screenshot",
 ]
 
+# Cap's local MCP server (`cap mcp serve`) exposes ~76 tools total --
+# library reads, safe writes (comments/reactions), org/billing/developer
+# admin, migrations, the works. Cap's own published docs describe the
+# capability groups but don't enumerate every tool name (unlike
+# Playwright/Buffer above, where the full list was directly available),
+# so this is a best-effort curation from the documented CLI/MCP command
+# groups (`cap caps list/get/context/transcript/download/status`) rather
+# than a verified exhaustive one. Deliberately scoped to READ-ONLY library
+# tools -- finding, opening, and reading past recordings -- and leaves out
+# everything from the org/billing/developer/credential-rotation tiers
+# entirely, since none of that has any place in a single-user personal
+# agent. Recording/uploading itself goes through the CLI via Bash instead
+# (see the system prompt) -- Cap's docs describe that lifecycle as CLI-
+# only, not exposed as MCP tool calls. If any of these names don't match
+# what your installed `cap mcp serve` actually exposes, nothing breaks --
+# PERMISSION_MODE=bypassPermissions means this list is documentation only,
+# same caveat as PLAYWRIGHT_TOOLS/BUFFER_TOOLS above -- just fix the
+# names here once you see the real ones (Claude Code's own /mcp tool list,
+# or any MCP inspector, will show them).
+CAP_TOOLS = [
+    "caps_list",
+    "caps_get",
+    "caps_context",
+    "caps_transcript",
+    "caps_download",
+    "caps_status",
+]
+
 # Curated subset of Buffer's official remote MCP server (mcp.buffer.com) --
 # it exposes 20+ tools including raw GraphQL escape hatches. Left out on
 # purpose: execute_query/execute_mutation/introspect_schema (arbitrary
@@ -112,7 +140,11 @@ Buffer media-fetch failures ("...video could not be read from its URL..." or sim
 
 Content performance (Buffer analytics): before suggesting what to post next for a brand you've posted for before, check how past posts actually did. get_post accepts includeMetrics=true for a single post's numbers, and get_aggregated_post_metrics rolls up reactions/comments/reach/impressions/engagement rate across a channel or set of channels over a date range you give it (organizationId, startDateTime, endDateTime, optionally channelIds/tags -- get organizationId from get_account first if you don't already have it cached). Reach/impressions/engagement rate only come back "when every channel in the filter supports them" -- if they're missing, say what you do have rather than reporting zeros. Buffer's free plan caps analytics history at 30 days; if a wider range comes back empty or truncated, tell the user that's the free-tier limit, not a fetch failure. After pulling numbers, don't just recite them -- note in plain language what actually performed well (topic, format, time of day, channel) and fold that into your next content suggestion for that brand. Save what you learn to memory_write at brand/<slug>-performance.md (which post/topic, what worked, the date range it's based on) so the pattern persists instead of re-deriving it every time; check that file first when planning new content for a brand you have performance data for.
 
-Video for posts: to use an existing video or image already on the machine, just find it with your file tools (Glob/Read/Bash) and pass its path to local_file_to_public_url. To make a new screen recording, use ffmpeg via Bash -- on Windows, `ffmpeg -y -f gdigrab -framerate 30 -i desktop -t <seconds> "media/recording.mp4"` captures the desktop for a fixed duration (ask the user how long, or default to something short like 15-30 seconds if they don't say); system audio capture needs extra Windows setup (a virtual audio device or Stereo Mix enabled) so default to video-only unless the user has that set up. If ffmpeg isn't installed/on PATH, tell the user rather than failing silently.
+Video for posts: to use an existing video or image already on the machine, just find it with your file tools (Glob/Read/Bash) and pass its path to local_file_to_public_url. To make a NEW screen recording, prefer Cap over raw ffmpeg if it's set up on this machine (see the Cap paragraph below) -- it gets you real transcription, an AI summary, and actual editing for free, where ffmpeg only ever gives you one raw, unedited clip. Fall back to plain ffmpeg via Bash -- on Windows, `ffmpeg -y -f gdigrab -framerate 30 -i desktop -t <seconds> "media/recording.mp4"` captures the desktop for a fixed duration (ask the user how long, or default to something short like 15-30 seconds if they don't say) -- only if Cap isn't installed/configured, or the ask is simple enough that a raw clip is genuinely all that's needed. Either way, system audio capture needs extra Windows setup (a virtual audio device or Stereo Mix enabled) so default to video-only unless the user has that set up.
+
+Screen recording (Cap): if Cap is set up on this machine (cap.so -- a one-time install, see config.py's CAP_ENABLED comment for the exact steps), drive its CLI via Bash for anything meant to be shared, posted, or kept -- not just a throwaway clip. Run `cap doctor --json` first if you've never confirmed this session's machine is capture-ready, and `cap targets --json` if you need to pick a specific screen/window rather than the default. To record: `cap record start --screen 1 --mode instant --duration <seconds> --json` (ask the user how long, default 15-30s if they don't say) or start/stop separately for an open-ended recording with `cap record start ... --json` then `cap record stop --json` once told to stop. Cap keeps processing after the recording stops (transcription, AI summary) -- run `cap caps wait <id> --for all --json` before treating it as ready to use. To turn a finished recording into something shareable, `cap upload ./recording.cap --export --name "<title>" --json` gives you back a file/link. Every Cap CLI command returns JSON on stdout -- parse that, don't screen-scrape human-readable text. Run `cap guide --json` once if you're ever unsure of the exact current command surface/flags. Never type a password, CAP_AGENT_TOKEN, API key, or any other secret Cap's CLI asks for into chat or a command yourself -- that's what `cap auth login` / `cap caps unlock` are for, and Cap's own docs are explicit that agents should never handle those directly.
+
+Cap's recordings library: once Cap is set up, you also have read-only tools (via its MCP server, not the CLI) for working with recordings already in the Cap library -- finding one by title, pulling up its metadata/URLs, and reading its full transcript or AI summary. Reach for these instead of re-processing a raw video file whenever the user asks about something they already recorded ("what did I actually say in yesterday's demo," "find my last recording about X") -- it's already transcribed and summarized, no re-watching required.
 
 Video editing: if the video-editor tools are available (video_record, video_edit, video_color, video_audio, video_text, video_compose, video_screenshot), use them for anything beyond a plain screen capture -- trimming/cropping a clip, burning in captions or subtitles (video_text can auto-caption via Whisper), color grading, or converting a recording to a specific social format (video_compose) before it goes to Buffer. This is a small, newer project the user opted into knowingly -- if a call errors or the server won't start, say so plainly rather than retrying repeatedly, and fall back to a plain ffmpeg command via Bash for anything simple enough not to need it. For narration specifically: don't reach for video_speech -- it needs a paid ElevenLabs/OpenAI key the user has deliberately chosen not to set up. Instead generate the narration for free with the same edge-tts engine used for spoken chat replies, straight from Bash: `edge-tts --voice "<EDGE_TTS_VOICE>" --text "..." --write-media narration.mp3` (use the configured voice, e.g. en-US-AvaNeural), then hand that mp3 to video_audio to mix it into the clip. Same zero-cost result, no key needed.
 
@@ -279,6 +311,21 @@ def _build_chat_options(
             "args": ["-y", "@studiomeyer/mcp-video@1.0.3"],
         }
         allowed += [f"mcp__video_editor__{name}" for name in VIDEO_EDITOR_TOOLS]
+
+    if config.CAP_ENABLED:
+        # Local stdio MCP server, same pattern as Playwright above -- but
+        # unlike Playwright/the video editor, `cap` is a real installed
+        # binary on this machine, not something npx fetches on the fly
+        # (see config.CAP_ENABLED's comment for the one-time install/login
+        # steps). No API key/header here: Cap's own auth lives in its CLI's
+        # local config from `cap auth login`, deliberately kept out of the
+        # MCP protocol and out of Neural's config entirely.
+        mcp_servers["cap"] = {
+            "type": "stdio",
+            "command": "cap",
+            "args": ["mcp", "serve"],
+        }
+        allowed += [f"mcp__cap__{name}" for name in CAP_TOOLS]
 
     if config.ADZUNA_ENABLED:
         # In-process SDK-MCP server (no subprocess, no remote MCP gateway --

@@ -164,6 +164,38 @@ GOOGLE_WORKSPACE_ENABLED = bool(
 # and ffmpeg, both already required elsewhere in Neural).
 VIDEO_EDITOR_ENABLED = os.getenv("VIDEO_EDITOR_ENABLED", "false").lower() == "true"
 
+# Cap (cap.so, open-source CapSoftware/Cap) -- screen recording built with
+# a real CLI and local MCP server FOR agents specifically (cap.so/agents),
+# unlike the plain ffmpeg gdigrab capture used above: Cap gives you actual
+# recording lifecycle management (start/stop/wait-for-processing),
+# automatic transcription and AI summaries of what was recorded, and a
+# whole existing library of past recordings the model can search and read
+# transcripts/summaries from -- ffmpeg just dumps an unedited .mp4 and
+# knows nothing about anything recorded before.
+#
+# Requires a real install on this machine first -- unlike Playwright/the
+# video editor above, this is NOT an npx-launched zero-install package:
+#   1. In an elevated PowerShell: irm https://cap.so/install-cli.ps1 | iex
+#      (installs the `cap` CLI and Cap Desktop if it isn't already there --
+#      the CLI ships bundled with Cap Desktop so both stay in version
+#      lockstep). Open a new terminal, then confirm with `cap version --json`.
+#   2. One-time browser login: `cap auth login --json` (or set the
+#      CAP_API_KEY / CAP_AGENT_TOKEN env var instead for a fully headless
+#      setup -- either is honored). This is deliberately NOT a Neural
+#      config value below: Cap's own docs specifically keep credentials
+#      out of the MCP protocol entirely and out of any agent's hands --
+#      `cap auth login` persists its own token in Cap's own local config,
+#      untouched by anything in this file or in Neural's .env.
+#   3. `cap doctor --json` to confirm this machine is actually ready to
+#      record (display access, permissions) before flipping this flag on.
+# Screen capture itself needs an active, unlocked display session the same
+# way ffmpeg's gdigrab does -- it is not something that can run against a
+# locked/logged-out Windows session. Off by default: this is a genuinely
+# new integration (Cap's own agent support launched in 2026) that needs
+# that manual install/login step first, so it's opt-in the same way
+# VIDEO_EDITOR_ENABLED is, not on-by-default the way Playwright is.
+CAP_ENABLED = os.getenv("CAP_ENABLED", "false").lower() == "true"
+
 # Buffer (buffer.com) -- posting/scheduling to LinkedIn, Instagram, X,
 # Facebook, Threads, TikTok, YouTube Shorts, and Pinterest, all through
 # Buffer's own OFFICIAL remote MCP server rather than a hand-rolled API

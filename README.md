@@ -723,6 +723,63 @@ outline for contrast, instead of relying on the tool's own small
 defaults -- ask it to go bigger/smaller/change the outline if a
 particular clip still doesn't read well.
 
+## Screen recording & editing (Cap)
+
+Beyond the plain `ffmpeg` desktop capture described above, Neural can use
+[Cap](https://cap.so) (open-source, CapSoftware/Cap) -- specifically
+[Cap for Agents](https://cap.so/agents), a real CLI and local MCP server
+Cap built and documents for AI agents to drive directly, not something
+bolted on for this project. Recording goes through Cap's CLI via Bash
+(`cap record start/stop`, `cap upload`, `cap doctor`, `cap targets`, `cap
+guide` -- every command returns JSON on stdout), and once recordings exist
+in your Cap library, a curated set of read-only MCP tools
+(`caps_list`/`caps_get`/`caps_context`/`caps_transcript`/`caps_download`/
+`caps_status`) let Neural find and read past recordings' transcripts and
+AI summaries without re-processing anything. This is a real step up from
+ffmpeg: Cap gives you actual editing, automatic transcription, and AI
+summaries for free; ffmpeg only ever gives you one raw, unedited `.mp4`
+with no memory of anything recorded before it.
+
+**Off by default.** Unlike Playwright or the video editor above, `cap`
+isn't something `npx` fetches on the fly -- it's a real binary that needs
+installing once. To turn it on:
+
+1. In PowerShell: `irm https://cap.so/install-cli.ps1 | iex` -- installs
+   the `cap` CLI (and Cap Desktop too, if it isn't already on the
+   machine; the CLI ships bundled with it so both stay on the same
+   version). Open a new terminal afterward and confirm with
+   `cap version --json`.
+2. Sign in once: `cap auth login --json` opens a browser for a one-time,
+   least-privilege authorization. (A fully headless alternative exists --
+   set a `CAP_API_KEY` or `CAP_AGENT_TOKEN` environment variable instead --
+   but either way this is **not** a Neural `.env` setting: Cap's own docs
+   are explicit that credentials stay out of the MCP protocol and out of
+   any agent's hands entirely. `cap auth login` persists its own token in
+   Cap's own local config, nothing in this repo touches it.)
+3. Run `cap doctor --json` to confirm this machine is actually ready to
+   record (display access, permissions) -- screen capture needs an
+   active, unlocked display session, same restriction ffmpeg's `gdigrab`
+   already has; it won't work against a locked/logged-out session.
+4. Set `CAP_ENABLED=true` in `.env` and restart the server.
+
+**Tool list is best-effort, not verified against a full dump.** Cap's own
+docs describe the local MCP server's capability groups (library reads,
+safe writes, resources, browser handoffs -- ~76 tools total) but don't
+publish every tool name the way Playwright's/Buffer's docs do, so
+`CAP_TOOLS` in `agent.py` is curated from the documented CLI/MCP command
+groups rather than a confirmed exhaustive list, and deliberately scoped to
+read-only library tools only -- nothing from the org/billing/developer/
+credential tiers, which have no place in a single-user personal agent
+anyway. If the real tool names differ once it's running, nothing breaks
+(same as every other curated allowlist here, `PERMISSION_MODE=
+bypassPermissions` means these lists are documentation, not an actual
+gate) -- just check the real names (Claude Code's own `/mcp` tool list, or
+any MCP inspector, will show them) and fix the constant.
+
+If this proves flaky or you'd rather not maintain another local install,
+set `CAP_ENABLED=false` again -- ffmpeg keeps working exactly as before,
+nothing else depends on Cap.
+
 ## Stock footage (Pexels)
 
 For a post that needs a video clip that isn't already on the machine,
