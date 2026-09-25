@@ -92,6 +92,17 @@ app = FastAPI(title="Neural")
 _shared_clients: dict[str, "ClaudeSDKClient | None"] = {"chat": None, "tutor": None}
 _chat_locks: dict[str, asyncio.Lock] = {"chat": asyncio.Lock(), "tutor": asyncio.Lock()}
 
+# Set by an explicit "interrupt" request from any connection (see
+# ws_endpoint's _reader) so _run_turn can shrink its own patience for a
+# turn that's ALREADY supposed to be stopping, instead of only ever
+# giving up after the full TURN_IDLE_TIMEOUT_SECONDS of true silence --
+# see config.POST_INTERRUPT_GRACE_SECONDS and _iter_with_timeout's
+# docstring for why client.interrupt() alone isn't enough to bound a
+# turn stuck inside a long tool call. Cleared at the start of every new
+# turn (see _run_turn) so a past interrupt never carries over and
+# shortens a LATER, unrelated turn's patience.
+_interrupt_events: dict[str, asyncio.Event] = {"chat": asyncio.Event(), "tutor": asyncio.Event()}
+
 # How many currently-connected websocket tabs/devices have Tutor mode
 # open right now, across the whole app -- not per connection. This is
 # what defines a tutoring "session" boundary (see tutor.py's module
@@ -139,16 +150,57 @@ async def _warm_shared_client(mode: str) -> None:
             logger.error("Failed to pre-warm the shared %s client: %s", mode, e)
 
 
-async def _iter_with_timeout(aiter, timeout: float):
+async def _iter_with_timeout(
+    aiter,
+    timeout: float,
+    interrupt_event: "asyncio.Event | None" = None,
+    grace_seconds: float = 20,
+    poll_interval: float = 1.0,
+):
     """Wrap an async iterator so a stalled upstream can't block forever.
     Used by _run_turn to bound how long it waits for the NEXT message
     from an in-progress turn (see config.TURN_IDLE_TIMEOUT_SECONDS).
     Raises asyncio.TimeoutError if nothing arrives within `timeout`
-    seconds of the previous item (or of starting)."""
+    seconds of the previous item (or of starting).
+
+    If `interrupt_event` is given, waiting for that NEXT item is polled
+    in short `poll_interval` slices (via asyncio.shield, so the real
+    underlying wait is never itself cancelled/restarted -- only this
+    function's OWN patience for it is re-evaluated each slice) instead of
+    one long wait_for. The moment the event becomes set mid-wait, the
+    remaining deadline is replaced with `grace_seconds` from THAT moment,
+    rather than whatever was left of `timeout` -- so an explicit user
+    interrupt can cut short a wait that's already deep into a long
+    `timeout`, not just affect waits that haven't started yet. This is
+    what actually bounds a turn stuck inside a tool call client.
+    interrupt() can't preempt (see config.POST_INTERRUPT_GRACE_SECONDS)."""
     it = aiter.__aiter__()
     while True:
+        next_task = asyncio.ensure_future(it.__anext__())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         try:
-            item = await asyncio.wait_for(it.__anext__(), timeout=timeout)
+            if interrupt_event is None:
+                item = await asyncio.wait_for(next_task, timeout=timeout)
+            else:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    try:
+                        item = await asyncio.wait_for(
+                            asyncio.shield(next_task), timeout=min(remaining, poll_interval)
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        if interrupt_event.is_set():
+                            grace_deadline = loop.time() + grace_seconds
+                            if grace_deadline < deadline:
+                                deadline = grace_deadline
+                        continue
+        except asyncio.TimeoutError:
+            next_task.cancel()
+            raise
         except StopAsyncIteration:
             return
         yield item
@@ -167,6 +219,11 @@ async def _run_turn(text: str, mode: str = "chat"):
         if client is None:
             client = await _new_client_resuming(mode)
             _shared_clients[mode] = client
+        # A past interrupt (meant for whatever turn was previously running
+        # on this mode's shared client) must never carry over and shorten
+        # THIS brand-new turn's patience -- see _interrupt_events' own
+        # comment above.
+        _interrupt_events[mode].clear()
         try:
             await client.query(text)
         except Exception as e:
@@ -181,7 +238,10 @@ async def _run_turn(text: str, mode: str = "chat"):
 
         try:
             async for msg in _iter_with_timeout(
-                client.receive_response(), config.TURN_IDLE_TIMEOUT_SECONDS
+                client.receive_response(),
+                config.TURN_IDLE_TIMEOUT_SECONDS,
+                interrupt_event=_interrupt_events[mode],
+                grace_seconds=config.POST_INTERRUPT_GRACE_SECONDS,
             ):
                 if isinstance(msg, ResultMessage) and msg.session_id:
                     # Only a turn that actually completed reaches here, so
@@ -190,13 +250,23 @@ async def _run_turn(text: str, mode: str = "chat"):
                     session_state.save_session_id(mode, msg.session_id)
                 yield msg
         except asyncio.TimeoutError:
-            logger.error(
-                "%s produced no output for %ds mid-turn -- treating the session as "
-                "wedged (a stuck tool call, or a `claude` CLI subprocess that stopped "
-                "responding without exiting) and discarding it so the NEXT message "
-                "gets a working client instead of blocking on this same lock forever.",
-                mode, config.TURN_IDLE_TIMEOUT_SECONDS,
-            )
+            if _interrupt_events[mode].is_set():
+                logger.error(
+                    "%s was interrupted but stayed stuck (likely a tool call already "
+                    "in flight that client.interrupt() can't preempt -- a recording, "
+                    "render, or similar) and didn't wrap up within the %ds grace "
+                    "period -- discarding it so the NEXT message gets a working "
+                    "client instead of waiting out whatever that tool call was doing.",
+                    mode, config.POST_INTERRUPT_GRACE_SECONDS,
+                )
+            else:
+                logger.error(
+                    "%s produced no output for %ds mid-turn -- treating the session as "
+                    "wedged (a stuck tool call, or a `claude` CLI subprocess that stopped "
+                    "responding without exiting) and discarding it so the NEXT message "
+                    "gets a working client instead of blocking on this same lock forever.",
+                    mode, config.TURN_IDLE_TIMEOUT_SECONDS,
+                )
             try:
                 await client.disconnect()
             except Exception:  # noqa: BLE001
@@ -683,12 +753,25 @@ async def ws_endpoint(websocket: WebSocket):
                             await client.interrupt()
                         except Exception as e:
                             logger.error("interrupt() failed: %s", e)
+                    # Also flips a flag _run_turn checks on its NEXT wait,
+                    # so a turn stuck inside a tool call client.interrupt()
+                    # can't actually preempt still gets forcibly cut off
+                    # within a short grace period instead of running for
+                    # however long that tool call takes -- see
+                    # config.POST_INTERRUPT_GRACE_SECONDS.
+                    _interrupt_events[conn_mode].set()
                     continue
                 if ptype == "set_mode":
                     new_mode = payload.get("mode")
                     if new_mode in ("chat", "tutor"):
                         await _handle_set_mode(new_mode)
                     continue
+                # Tag the mode THIS message was actually sent in, rather
+                # than letting the main loop re-read conn_mode whenever it
+                # eventually gets dequeued -- a message queued in chat mode
+                # must still be processed as a chat turn even if the user
+                # switches to Tutor mode before the main loop gets to it.
+                payload["_mode"] = conn_mode
                 await in_queue.put(payload)
         except WebSocketDisconnect:
             pass
@@ -704,15 +787,41 @@ async def ws_endpoint(websocket: WebSocket):
             if payload is _DISCONNECTED:
                 break
 
+            # Coalesce: if more messages already piled up behind this one
+            # before we got to it, only the LAST one still matters. This
+            # only ever happens when an earlier turn is still running when
+            # further messages arrive (a slow recording/render, or a
+            # wedged session) -- app.js's bargeIn()/sendMessage() already
+            # advances activeTurnId the instant it queues a newer message,
+            # so the frontend would silently discard every earlier one's
+            # reply anyway once it finally streamed back (see its turn_id
+            # filter). Skipping straight to the newest instead of actually
+            # running _run_turn for each superseded one in between avoids
+            # spending a full turn's worth of tokens generating output
+            # nobody will ever see -- the real fix for credits still
+            # burning even after a stuck task: previously EVERY queued
+            # message got a full, real, paid turn regardless of whether
+            # anyone would ever see the answer.
+            while not in_queue.empty():
+                nxt = in_queue.get_nowait()
+                if nxt is _DISCONNECTED:
+                    payload = _DISCONNECTED
+                    break
+                payload = nxt
+            if payload is _DISCONNECTED:
+                break
+
             text = payload.get("text", "")
             if not text:
                 continue
-            # Snapshot the mode for this one turn -- if the user switches
-            # modes again while this turn is still running, THIS turn
-            # still finishes against the mode it started in; the switch
-            # takes effect for the next message, same as conn_mode being
-            # read fresh each time through this loop already implies.
-            mode = conn_mode
+            # The mode THIS message was actually sent in (tagged by
+            # _reader at enqueue time), not whatever conn_mode happens to
+            # be NOW -- a message queued in chat mode must still run as a
+            # chat turn even if the user switched to Tutor mode before the
+            # main loop got around to dequeuing it. Falls back to conn_mode
+            # only for defensiveness (every message _reader enqueues is
+            # already tagged).
+            mode = payload.get("_mode", conn_mode)
             # Echoed back on every event this turn produces, so the
             # frontend can tell a barge-in's new turn apart from stray
             # leftover events a just-interrupted older turn is still

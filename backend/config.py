@@ -93,6 +93,30 @@ UTILITY_MODEL = os.getenv("UTILITY_MODEL", "claude-haiku-4-5-20251001")
 # real hang self-heal instead of requiring a manual restart.
 TURN_IDLE_TIMEOUT_SECONDS = int(os.getenv("TURN_IDLE_TIMEOUT_SECONDS", "300"))
 
+# How long a turn gets to actually wrap up once the user explicitly
+# interrupts it (barge-in, or typing a new message while an old one is
+# still running -- see app.js's bargeIn/sendMessage), before main.py
+# forcibly tears the whole client down instead of continuing to wait on
+# it. This is NOT the same as TURN_IDLE_TIMEOUT_SECONDS above: that one
+# only fires after true silence (no message at all from the SDK for the
+# full timeout), but a turn stuck inside a long-running tool call --
+# a screen recording, a video render, anything that shells out and
+# blocks -- can keep emitting periodic tool_use/tool_result messages
+# that reset the idle timer indefinitely, so it would otherwise run to
+# completion no matter how long that takes even after being told to
+# stop, because client.interrupt() only asks the MODEL to stop
+# generating -- it cannot preempt a tool call the CLI has already
+# dispatched and is waiting on. Once an interrupt is requested, this
+# much shorter window replaces the long idle timeout for the REST of
+# that turn, so a stuck tool call gets forcibly cut off (same recovery
+# path as an idle timeout: the client is torn down and rebuilt fresh)
+# well within seconds of the user actually asking to move on, instead of
+# silently burning tokens on a reply the frontend has already committed
+# to discarding (see app.js's turn_id filtering, and this fix's sibling
+# in ws_endpoint's message loop that stops even STARTING a turn for a
+# message that's already been superseded by a newer one).
+POST_INTERRUPT_GRACE_SECONDS = int(os.getenv("POST_INTERRUPT_GRACE_SECONDS", "20"))
+
 # How old a saved chat/tutor session_id (see session_state.py) can be
 # before it stops getting resumed and main.py starts a fresh conversation
 # instead. Exists specifically to stop unbounded usage growth: "resume"
