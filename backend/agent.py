@@ -74,19 +74,25 @@ VIDEO_EDITOR_TOOLS = [
 
 # Cap's local MCP server (`cap mcp serve`) exposes ~76 tools total --
 # library reads, safe writes (comments/reactions), org/billing/developer
-# admin, migrations, the works. Cap's own published docs describe the
-# capability groups but don't enumerate every tool name (unlike
-# Playwright/Buffer above, where the full list was directly available),
-# so this is a best-effort curation from the documented CLI/MCP command
-# groups (`cap caps list/get/context/transcript/download/status`) rather
-# than a verified exhaustive one. Deliberately scoped to READ-ONLY library
-# tools -- finding, opening, and reading past recordings -- and leaves out
-# everything from the org/billing/developer/credential-rotation tiers
-# entirely, since none of that has any place in a single-user personal
-# agent. Recording/uploading itself goes through the CLI via Bash instead
-# (see the system prompt) -- Cap's docs describe that lifecycle as CLI-
-# only, not exposed as MCP tool calls. If any of these names don't match
-# what your installed `cap mcp serve` actually exposes, nothing breaks --
+# admin, migrations, the works. `cap guide --json` (Cap's own authoritative
+# self-description, confirmed live on this install) enumerates every CLI
+# COMMAND group but not the separate MCP tool names, so this list is still
+# a best-effort mapping from the confirmed CLI subcommands under `caps`
+# (list, get, context, status, wait, transcript, download -- all
+# documented as read-only: "Cap library reads and waits never start
+# transcription, AI generation, or other paid processing") to the
+# `caps_<verb>` naming MCP tools conventionally use, rather than a
+# verified dump of the real tool names. Deliberately scoped to those
+# READ-ONLY library tools -- finding, opening, reading, and waiting on
+# past recordings -- and leaves out everything from caps
+# comments/reactions/update/sharing/duplicate/delete/password/unlock (all
+# explicitly "confirmed Cap lifecycle operations" per the CLI guide, i.e.
+# mutating) and the entire org/billing/developer/credential tiers, since
+# none of that has any place in a single-user personal agent. Recording/
+# uploading/exporting itself goes through the CLI via Bash instead (see
+# the system prompt) -- confirmed as CLI-only commands (record/export/
+# upload), not exposed as MCP tool calls. If any of these names don't
+# match what `cap mcp serve` actually exposes, nothing breaks --
 # PERMISSION_MODE=bypassPermissions means this list is documentation only,
 # same caveat as PLAYWRIGHT_TOOLS/BUFFER_TOOLS above -- just fix the
 # names here once you see the real ones (Claude Code's own /mcp tool list,
@@ -95,9 +101,10 @@ CAP_TOOLS = [
     "caps_list",
     "caps_get",
     "caps_context",
+    "caps_status",
+    "caps_wait",
     "caps_transcript",
     "caps_download",
-    "caps_status",
 ]
 
 # Curated subset of Buffer's official remote MCP server (mcp.buffer.com) --
@@ -142,7 +149,7 @@ Content performance (Buffer analytics): before suggesting what to post next for 
 
 Video for posts: to use an existing video or image already on the machine, just find it with your file tools (Glob/Read/Bash) and pass its path to local_file_to_public_url. To make a NEW screen recording, prefer Cap over raw ffmpeg if it's set up on this machine (see the Cap paragraph below) -- it gets you real transcription, an AI summary, and actual editing for free, where ffmpeg only ever gives you one raw, unedited clip. Fall back to plain ffmpeg via Bash -- on Windows, `ffmpeg -y -f gdigrab -framerate 30 -i desktop -t <seconds> "media/recording.mp4"` captures the desktop for a fixed duration (ask the user how long, or default to something short like 15-30 seconds if they don't say) -- only if Cap isn't installed/configured, or the ask is simple enough that a raw clip is genuinely all that's needed. Either way, system audio capture needs extra Windows setup (a virtual audio device or Stereo Mix enabled) so default to video-only unless the user has that set up.
 
-Screen recording (Cap): if Cap is set up on this machine (cap.so -- a one-time install, see config.py's CAP_ENABLED comment for the exact steps), drive its CLI via Bash for anything meant to be shared, posted, or kept -- not just a throwaway clip. Run `cap doctor --json` first if you've never confirmed this session's machine is capture-ready, and `cap targets --json` if you need to pick a specific screen/window rather than the default. To record: `cap record start --screen 1 --mode instant --duration <seconds> --json` (ask the user how long, default 15-30s if they don't say) or start/stop separately for an open-ended recording with `cap record start ... --json` then `cap record stop --json` once told to stop. Cap keeps processing after the recording stops (transcription, AI summary) -- run `cap caps wait <id> --for all --json` before treating it as ready to use. To turn a finished recording into something shareable, `cap upload ./recording.cap --export --name "<title>" --json` gives you back a file/link. Every Cap CLI command returns JSON on stdout -- parse that, don't screen-scrape human-readable text. Run `cap guide --json` once if you're ever unsure of the exact current command surface/flags. Never type a password, CAP_AGENT_TOKEN, API key, or any other secret Cap's CLI asks for into chat or a command yourself -- that's what `cap auth login` / `cap caps unlock` are for, and Cap's own docs are explicit that agents should never handle those directly.
+Screen recording (Cap): if Cap is set up on this machine (cap.so -- a one-time install, see config.py's CAP_ENABLED comment for the exact steps), drive its CLI via Bash for anything meant to be shared, posted, or kept -- not just a throwaway clip. Run `cap doctor --json` first if you've never confirmed this session's machine is capture-ready, and `cap targets --json` if you need to pick a specific screen/window rather than the default (its `id` feeds back into record). For a known, fixed length: `cap record start --duration <seconds> --json` (ask the user how long, default 15-30s if they don't say) runs in the foreground, blocks until done, and emits a `started` event then a `stopped` event once it's actually finished -- treat that as the recording being complete. For an open-ended recording where you don't know the length up front, add `--detach` instead -- it returns immediately with a `recordingId` and keeps recording in the background; check on it with `cap record status --json` and end it with `cap record stop --json` (passing that recordingId) once told to stop. Either way, Cap keeps processing afterward (transcription, AI summary) -- run `cap caps wait <id> --for all --json` before treating it as ready to use elsewhere. To get a plain video file from the finished `.cap` project, `cap export --json` renders it (this one streams NDJSON progress events in a different shape than other commands -- PascalCase `type` tags, not the usual camelCase); to get something shareable instead, `cap upload <path> --json` returns a link directly, project or exported file either one. Every Cap CLI command returns JSON on stdout with `--json` -- parse that, don't screen-scrape human-readable text. Run `cap guide --json` any time you're unsure of the exact current command/flag surface -- it's Cap's own live self-description and is authoritative over anything you think you remember about it. Never type a password, CAP_AGENT_TOKEN, API key, or any other secret Cap's CLI asks for into chat or a command yourself -- that's what `cap auth login` / `cap caps unlock` are for, and Cap's own docs are explicit that agents should never handle those directly.
 
 Cap's recordings library: once Cap is set up, you also have read-only tools (via its MCP server, not the CLI) for working with recordings already in the Cap library -- finding one by title, pulling up its metadata/URLs, and reading its full transcript or AI summary. Reach for these instead of re-processing a raw video file whenever the user asks about something they already recorded ("what did I actually say in yesterday's demo," "find my last recording about X") -- it's already transcribed and summarized, no re-watching required.
 
