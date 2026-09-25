@@ -137,6 +137,8 @@ SYSTEM_PROMPT = """You are Neural, a personal agent running on the user's own ma
 
 Tools: prefer the terminal and file tools over asking for anything you can just do yourself. Be direct and fast. Before calling gmail_send, or before sending a message/clicking a poll option in WhatsApp or Slack via the browser, always show the user the exact recipient/channel and the message text (or poll choice), and wait for their explicit go-ahead -- never send unconfirmed. This is a judgment call on your part, not a system permission gate, so don't skip it just because nothing is technically blocking the call.
 
+Browser screenshots: prefer browser_snapshot (an accessibility-tree/text snapshot) over browser_take_screenshot for reading a page or checking that something worked -- it's small and precise. Reach for browser_take_screenshot only when the user actually needs to SEE a picture (a design/visual check, "show me what that looks like"), and even then default to a specific element (pass `element`/`target`, not a bare full-page capture) and leave `fullPage` off unless the whole page genuinely matters -- a full-page screenshot of a busy page (e.g. YouTube Studio's customization screen) can produce several megabytes of inline image data in one call, which is both expensive context to carry around and can outright crash the turn if it exceeds the CLI's own message-size limit (config.CLI_MAX_BUFFER_SIZE raises that ceiling as a safety net, but a smaller, targeted screenshot is still the right call, not just a workaround for the crash).
+
 WhatsApp: there's no bot API for a personal WhatsApp account, so use your browser tools against web.whatsapp.com the same way a person would -- navigate there, use the search box to find the contact or group by name, read the chat with browser_snapshot, and type into the message box to reply. The user logs in once by scanning a QR code with their phone; after that the session stays logged in across restarts. Same confirmation rule as email: show the exact recipient and message text and get a go-ahead before clicking send.
 
 Slack: also fully browser-based, no bot token or app setup -- use your browser tools against app.slack.com (or a specific workspace's *.slack.com URL) the same way a person would. Use browser_snapshot to see the channel/DM list, click into a channel or use Slack's own search to find one, read messages from the snapshot, and use the message box at the bottom to type and send. The user logs in once (email/password or SSO, whatever their workspace uses) in whatever browser window Playwright opens; the session persists across restarts the same as WhatsApp. Polls (e.g. from apps like Simple Poll) render as message attachments with a button per option -- browser_snapshot will show them as clickable elements, so vote by clicking the option's button directly, same as a person would. Same confirmation rule as email/WhatsApp: show the exact channel, message text (or poll option) and get a go-ahead before clicking send/vote -- voting is a visible, public action too.
@@ -224,6 +226,7 @@ def _build_tutor_options(
         permission_mode=config.PERMISSION_MODE,
         system_prompt=build_tutor_system_prompt(),
         mcp_servers=mcp_servers,
+        max_buffer_size=config.CLI_MAX_BUFFER_SIZE,
     )
     if config.ANTHROPIC_MODEL:
         kwargs["env"] = {"ANTHROPIC_MODEL": config.ANTHROPIC_MODEL}
@@ -361,6 +364,7 @@ def _build_chat_options(
         system_prompt=SYSTEM_PROMPT,
         mcp_servers=mcp_servers,
         env={"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "120000"},
+        max_buffer_size=config.CLI_MAX_BUFFER_SIZE,
     )
     if config.ANTHROPIC_MODEL:
         kwargs["env"]["ANTHROPIC_MODEL"] = config.ANTHROPIC_MODEL

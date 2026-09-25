@@ -26,7 +26,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -40,6 +40,7 @@ from claude_agent_sdk import (
     tool,
 )
 
+from . import config
 from .agent import new_client, wrap_for_automation
 from .events import bus
 
@@ -381,6 +382,31 @@ async def run_automation(task_id: str) -> None:
         logger.error("Failed to deliver automation result to chat: %s", exc)
 
 
+def _missed_fire_time(trigger: CronTrigger, since: datetime, before: datetime) -> Optional[datetime]:
+    """The most recent time `trigger` would have fired in the window
+    (since, before], or None if it wouldn't have fired at all in that
+    window. Used by start_scheduler to detect an automation whose
+    scheduled time already passed while Neural wasn't running to fire it.
+
+    APScheduler's own CronTrigger has no built-in way to ask "what's the
+    last time you WOULD have fired before now" (only "what's the next
+    time after X"), so this walks forward from `since` one occurrence at
+    a time via the trigger's own get_next_fire_time, keeping the last one
+    that's still <= `before`. Cheap in practice: every automation here is
+    daily or monthly, so this resolves in a handful of hops, never
+    thousands -- the iteration cap is just a defensive backstop against a
+    pathological cron, not something normal use should ever approach."""
+    last = None
+    cursor = since
+    for _ in range(10_000):
+        nxt = trigger.get_next_fire_time(cursor, cursor)
+        if nxt is None or nxt > before:
+            break
+        last = nxt
+        cursor = nxt
+    return last
+
+
 def start_scheduler() -> None:
     """Load persisted tasks, schedule the enabled ones, and start the
     scheduler. Call once at app startup.
@@ -402,13 +428,36 @@ def start_scheduler() -> None:
     silently no-op'ing while still claiming "enabled") rather than taking
     the rest of the app down with it. Fix the automation's schedule in the
     UI and re-enable it once it's valid again.
+
+    Missed-run catch-up: the scheduler here uses APScheduler's default
+    in-memory job store, so it has no memory across a restart of what
+    SHOULD have fired while the process was down -- every job is rebuilt
+    from scratch each time this runs, and a freshly built CronTrigger only
+    ever looks FORWARD from "now." That meant an automation whose 9am (or
+    whatever) slot passed while Neural was off, asleep, or mid-restart
+    just silently jumped to its NEXT future slot with nothing to show for
+    the one it missed -- indistinguishable from "automations aren't
+    triggering at all" from the user's side. Now, for every enabled task,
+    this checks whether its cron says it should have fired at some point
+    since its last recorded run (bounded by
+    config.AUTOMATION_CATCHUP_LOOKBACK_DAYS, so this never reaches back
+    further than that even for a task that's never run at all) and, if
+    so, runs it ONCE right after startup -- never once per missed
+    occurrence, since these automations have real side effects (posting,
+    clicking a poll, pulling metrics) that shouldn't replay for every day
+    that was missed.
     """
     tasks = _load()
     changed = False
+    now = datetime.now(timezone.utc)
+    lookback_floor = now - timedelta(days=config.AUTOMATION_CATCHUP_LOOKBACK_DAYS)
+    to_catch_up: list[str] = []
+
     for task_id, task in tasks.items():
         if not task.get("enabled"):
             continue
         try:
+            trigger = CronTrigger.from_crontab(task["cron"])
             _schedule(task_id, task)
         except Exception as exc:  # noqa: BLE001 -- one bad automation must never take the whole backend down
             logger.error(
@@ -418,7 +467,29 @@ def start_scheduler() -> None:
             )
             task["enabled"] = False
             changed = True
+            continue
+
+        last_run_dt = None
+        last_run_raw = task.get("last_run")
+        if last_run_raw:
+            try:
+                last_run_dt = datetime.fromisoformat(last_run_raw)
+            except ValueError:
+                last_run_dt = None
+        since = max(last_run_dt, lookback_floor) if last_run_dt else lookback_floor
+        if since < now and _missed_fire_time(trigger, since, now) is not None:
+            to_catch_up.append(task_id)
+
     if changed:
         _save(tasks)
     if not scheduler.running:
         scheduler.start()
+
+    for task_id in to_catch_up:
+        name = tasks.get(task_id, {}).get("name", "?")
+        logger.info(
+            'Automation "%s" (id %s) missed its scheduled time while Neural wasn\'t '
+            "running -- catching it up now instead of waiting for its next slot.",
+            name, task_id,
+        )
+        asyncio.create_task(run_automation(task_id))

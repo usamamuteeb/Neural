@@ -117,6 +117,41 @@ TURN_IDLE_TIMEOUT_SECONDS = int(os.getenv("TURN_IDLE_TIMEOUT_SECONDS", "300"))
 # message that's already been superseded by a newer one).
 POST_INTERRUPT_GRACE_SECONDS = int(os.getenv("POST_INTERRUPT_GRACE_SECONDS", "20"))
 
+# The claude-agent-sdk's own hard cap (ClaudeAgentOptions.max_buffer_size)
+# on a single JSON message read from the `claude` CLI's stdout before it
+# gives up parsing and raises CLIJSONDecodeError -- "JSON message exceeded
+# maximum buffer size of 1048576 bytes" (see
+# claude_agent_sdk/_internal/transport/subprocess_cli.py:
+# _DEFAULT_MAX_BUFFER_SIZE = 1024 * 1024, i.e. 1 MiB, if left unset).
+# Confirmed live: a Playwright browser_take_screenshot call on a busy page
+# (e.g. YouTube Studio's channel customization screen) can return enough
+# inline base64 image data in one tool_result to blow straight past that
+# 1 MiB default, which crashes the ENTIRE turn outright (this error
+# surfaces as the literal chat reply, not a caught/handled failure) rather
+# than just that one tool call. 1 MiB is the SDK's own conservative
+# default, not something tuned for an agent doing real screen automation,
+# so this raises it well clear of what a single large screenshot/file
+# read can produce. This does NOT fix the underlying cost of a huge
+# image riding along in context -- see agent.py's system prompt for
+# guidance on preferring smaller/targeted screenshots -- it only stops
+# that case from crashing the turn outright.
+CLI_MAX_BUFFER_SIZE = int(os.getenv("CLI_MAX_BUFFER_SIZE", str(20 * 1024 * 1024)))
+
+# How far back start_scheduler() will look, at every restart, for an
+# automation whose scheduled time already passed while Neural wasn't
+# running -- see automations.py's start_scheduler docstring. APScheduler
+# is using its default in-memory job store here (not a persistent one),
+# so it has NO memory across a restart of what SHOULD have fired while
+# the process was down -- every job is rebuilt from scratch on startup,
+# and a freshly (re)built CronTrigger only ever looks FORWARD from "now,"
+# so a missed 9am run was previously just silently skipped straight to
+# tomorrow's 9am with nothing to show for it. 7 days is generous enough
+# to catch "the laptop was off all weekend" without reaching back far
+# enough to fire something that was due weeks ago and isn't relevant
+# anymore. Only the single MOST RECENT missed occurrence is ever caught
+# up, never one run per day missed -- see start_scheduler.
+AUTOMATION_CATCHUP_LOOKBACK_DAYS = int(os.getenv("AUTOMATION_CATCHUP_LOOKBACK_DAYS", "7"))
+
 # How old a saved chat/tutor session_id (see session_state.py) can be
 # before it stops getting resumed and main.py starts a fresh conversation
 # instead. Exists specifically to stop unbounded usage growth: "resume"
