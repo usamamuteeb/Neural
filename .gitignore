@@ -31,3 +31,7 @@ test.mp3
 # just that run's console output, not something to version.
 *.log
 *.err
+
+# Separate personal project Neural has built inside this folder (its own
+# app, with its own nested git repo) -- not part of Neural itself.
+projects/

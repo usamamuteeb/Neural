@@ -824,6 +824,54 @@ trimming, captions, color grading, or narration, exactly like a screen
 recording -- real footage is the raw material, the editor is what turns
 it into finished content.
 
+## Vercel projects
+
+Neural can deploy, check on, and manage environment variables for your
+Vercel projects, driven straight through the official `vercel` CLI via
+Bash -- not a dedicated tool or MCP server.
+
+**Why the CLI instead of Vercel's own remote MCP server
+(mcp.vercel.com):** it was checked first and ruled out on two counts --
+its authentication is interactive-OAuth-only (every documented client
+is "click to authorize," no static-token path at all), which doesn't
+work for an agent that runs unattended with no one around to click an
+OAuth popup, and its tool list has no environment-variable management
+tools at all, which was the actual point of asking for this. The `vercel`
+CLI plus a personal access token is Vercel's own officially documented
+non-interactive pattern for agents instead (see
+[vercel-labs/agent-skills' "vercel-cli-with-tokens" skill](https://github.com/vercel-labs/agent-skills/blob/main/skills/vercel-cli-with-tokens/SKILL.md)),
+and it fits Neural's existing terminal-first approach (same idea as Cap,
+ffmpeg, and ImageMagick elsewhere in this doc).
+
+**Setup:**
+
+1. Install the CLI if it isn't already on this machine: `npm i -g vercel`.
+2. Create a personal access token at
+   [vercel.com/account/tokens](https://vercel.com/account/tokens) (it
+   starts with `vca_`). Treat it like a password.
+3. Paste it into `.env` as `VERCEL_TOKEN`. Leave it blank to keep the
+   feature off -- Neural checks for this itself before doing anything
+   Vercel-related.
+4. Optional, to skip an interactive `vercel link` prompt when working
+   against one specific project: run `vercel link` once by hand inside
+   that project's folder, then copy the `orgId`/`projectId` values it
+   writes to `.vercel/project.json` into `.env` as `VERCEL_ORG_ID` and
+   `VERCEL_PROJECT_ID` (set both together, not just one).
+5. Optional, only if you deploy under a team rather than your personal
+   account: set `VERCEL_TEAM_SLUG` in `.env` (from the team's URL/
+   settings in the Vercel dashboard). Neural passes this as `--scope`
+   on every command so it hits the right account.
+
+**What Neural will and won't do on its own:** listing projects, reading
+env vars (`vercel env ls`), and checking deployment status/logs are all
+fine without asking first. A production deploy (`vercel deploy --prod`)
+and adding/changing an environment variable both get the same
+confirm-before-acting treatment as sending an email or a social post --
+Neural will show you exactly what it's about to do and wait for a
+go-ahead, since either one can change what's actually live. Preview
+deployments (the default) are lower-stakes but Neural still tells you
+when it's kicking one off.
+
 ## Content creation (brand kit)
 
 For any content aimed at a specific brand/project (as opposed to a

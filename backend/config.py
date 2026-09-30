@@ -61,6 +61,45 @@ ADZUNA_ENABLED = bool(ADZUNA_APP_ID and ADZUNA_APP_KEY)
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 PEXELS_ENABLED = bool(PEXELS_API_KEY)
 
+# Vercel projects -- deploying, checking deployment status/logs, and
+# managing environment variables, all driven straight through the
+# official `vercel` CLI via Bash (already unconditionally available --
+# see ALLOWED_TOOLS below), not a dedicated MCP server. Vercel's own
+# remote MCP server (mcp.vercel.com) was considered first instead, but
+# ruled out on inspection: its auth is interactive-OAuth-only with no
+# static-token path at all, and its tool list has no environment-variable
+# management tools whatsoever -- both non-starters for an agent that runs
+# unattended (PERMISSION_MODE=bypassPermissions, no human around to click
+# "allow" on an OAuth popup) and that needs real env-var read/write
+# access. The CLI + a personal access token is Vercel's own documented
+# non-interactive pattern instead -- see the official
+# vercel-labs/agent-skills "vercel-cli-with-tokens" skill, which agent.py's
+# system prompt follows.
+#
+# One-time setup:
+#   1. `npm i -g vercel` on this machine if the `vercel` CLI isn't
+#      already installed.
+#   2. Create a personal access token at
+#      https://vercel.com/account/tokens (it starts with `vca_`). Treat
+#      it like a password -- Neural is instructed to always read it from
+#      this environment variable and never pass it via a `--token` flag,
+#      which would leak it into shell history and process listings.
+#   3. Paste that token into VERCEL_TOKEN below.
+# Optional, but skips an interactive `vercel link` prompt when Neural
+# runs a command against a specific project: run `vercel link` once by
+# hand inside that project's folder, then copy the orgId/projectId it
+# writes to .vercel/project.json into VERCEL_ORG_ID/VERCEL_PROJECT_ID
+# below (set both together or leave both blank -- one without the other
+# is worse than neither). If you deploy under a team rather than your
+# personal account, also set VERCEL_TEAM_SLUG (from the team's Vercel
+# URL/settings) -- Neural passes it as --scope on every command so it
+# hits the right account.
+VERCEL_TOKEN = os.getenv("VERCEL_TOKEN", "")
+VERCEL_ORG_ID = os.getenv("VERCEL_ORG_ID", "")
+VERCEL_PROJECT_ID = os.getenv("VERCEL_PROJECT_ID", "")
+VERCEL_TEAM_SLUG = os.getenv("VERCEL_TEAM_SLUG", "")
+VERCEL_ENABLED = bool(VERCEL_TOKEN)
+
 WAKE_PHRASE = os.getenv("WAKE_PHRASE", "Wake up")
 
 # Technical Tutor mode -- how many days a cached, summarized doc page
