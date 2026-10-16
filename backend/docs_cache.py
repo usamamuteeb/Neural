@@ -132,7 +132,7 @@ async def _fetch_and_summarize(url: str) -> dict[str, Any]:
         "roughly 200-400 words, no meta-commentary about being a summary.\n\n"
         f"Page title: {title}\n\nPage text:\n{page_text[:_MAX_SUMMARY_INPUT_CHARS]}"
     )
-    summary = (await utility.quick_task(summary_prompt)).strip()
+    summary = (await utility.quick_task(summary_prompt, task="documentation_summary")).strip()
     if not summary:
         summary = page_text[:1500]  # utility model failed for some reason -- fall back to raw text
 

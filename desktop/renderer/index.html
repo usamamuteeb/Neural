@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src ws: wss:; worker-src 'self' blob:;">
+  <title>Neural</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="side-left">
+  <div id="stage">
+    <section id="bubbleCol">
+      <div id="bubble" class="hit hidden" role="log" aria-live="polite">
+        <div class="bubble-head">
+          <span id="bubbleTitle">Neural</span>
+          <span class="spacer"></span>
+          <button id="bubbleHistory" type="button" title="History">
+            <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4M12 8v4l3 2"/></svg>
+          </button>
+          <button id="bubbleCopy" type="button" title="Copy reply">
+            <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>
+          </button>
+          <button id="bubbleClose" type="button" title="Close">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+        <div id="bubbleUser" hidden></div>
+        <div id="bubbleBody"></div>
+        <div id="fileList" hidden></div>
+      </div>
+      <div id="pills" hidden></div>
+    </section>
+
+    <section id="avatarCol">
+      <div id="handle" class="hit" title="Drag to move -- right-click Neural for more">
+        <span class="dot" id="connDot"></span>
+        <span class="grip"></span>
+        <button id="btnMenu" type="button" title="Menu">
+          <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
+        </button>
+        <button id="btnHide" type="button" title="Hide (tray icon brings her back)">
+          <svg viewBox="0 0 24 24"><path d="M6 12h12"/></svg>
+        </button>
+        <button id="btnQuit" type="button" title="Quit Neural Desktop">
+          <svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg>
+        </button>
+      </div>
+      <div id="avatarBox"></div>
+      <div id="status" aria-live="polite"></div>
+      <div id="pending" class="hit" hidden></div>
+      <form id="inputRow" class="hit" autocomplete="off">
+        <input id="input" type="text" placeholder="Talk to Neural..." spellcheck="false" maxlength="4000">
+        <button id="micBtn" type="button" title="Hold to talk (or tap, then just speak)">
+          <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+        </button>
+      </form>
+      <div id="resizeGrip" class="hit" title="Drag to resize"></div>
+    </section>
+  </div>
+  <audio id="tts" preload="auto"></audio>
+
+  <script src="../../frontend/avatar.js"></script>
+  <script src="markdown.js"></script>
+  <script src="voice.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

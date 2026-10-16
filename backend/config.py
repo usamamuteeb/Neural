@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -114,11 +115,90 @@ TUTOR_DOCS_CACHE_DAYS = int(os.getenv("TUTOR_DOCS_CACHE_DAYS", "14"))
 # Empty string = let the Agent SDK pick its own default model.
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "")
 
+# Extended thinking for interactive chat turns: "off" (default) disables it
+# -- spoken replies are short, and thinking mostly adds delay before the
+# first word plus extra tokens. Background jobs and automations always keep
+# the model's default. Set to "default" to let the CLI decide again.
+CHAT_THINKING = os.getenv("CHAT_THINKING", "off").strip().lower()
+
+# Managed background jobs (backend/background.py): long tasks the chat
+# agent hands to a separate worker so the conversation stays free. Limits
+# keep a stuck job from running forever: JOB_MAX_SECONDS total (kept under
+# VIDEO_RENDER_MAX_SECONDS so the job's own cleanup always runs before the
+# global reaper would), JOB_IDLE_TIMEOUT_SECONDS without any progress.
+MAX_BACKGROUND_JOBS = int(os.getenv("MAX_BACKGROUND_JOBS", "2"))
+JOB_MAX_SECONDS = int(os.getenv("JOB_MAX_SECONDS", str(25 * 60)))
+JOB_IDLE_TIMEOUT_SECONDS = int(os.getenv("JOB_IDLE_TIMEOUT_SECONDS", str(10 * 60)))
+
+# Same limits for scheduled automations, which previously had none at all
+# (one stuck tool call could hang an automation run forever).
+AUTOMATION_MAX_SECONDS = int(os.getenv("AUTOMATION_MAX_SECONDS", str(25 * 60)))
+AUTOMATION_IDLE_TIMEOUT_SECONDS = int(os.getenv("AUTOMATION_IDLE_TIMEOUT_SECONDS", str(10 * 60)))
+
+# Social media / video link analysis (backend/media_analysis.py) -- free and
+# local: yt-dlp fetches metadata + captions + a small copy of the video,
+# Whisper transcribes on-device when there are no captions, ffmpeg/PyAV
+# grabs still frames for vision. Needs `pip install -U yt-dlp
+# faster-whisper` in the backend venv.
+#   MEDIA_WHISPER_MODEL: tiny / base / small / medium -- bigger is more
+#     accurate but slower on CPU. "base" is a good default.
+#   MEDIA_MAX_TRANSCRIBE_MINUTES: skip Whisper for caption-less videos
+#     longer than this (captions are always used when present).
+#   MEDIA_MAX_DOWNLOAD_MINUTES: don't download longer videos just for
+#     frames (explicit frame_times still work).
+#   MEDIA_COOKIES_FROM_BROWSER / MEDIA_COOKIES_FILE: optional, for
+#     login-gated posts (Instagram, Facebook, private videos). Set the
+#     browser name (firefox, chrome, edge) or a Netscape cookies.txt path.
+MEDIA_WHISPER_MODEL = os.getenv("MEDIA_WHISPER_MODEL", "base").strip() or "base"
+MEDIA_MAX_TRANSCRIBE_MINUTES = int(os.getenv("MEDIA_MAX_TRANSCRIBE_MINUTES", "45"))
+MEDIA_MAX_DOWNLOAD_MINUTES = int(os.getenv("MEDIA_MAX_DOWNLOAD_MINUTES", "60"))
+MEDIA_COOKIES_FILE = os.getenv("MEDIA_COOKIES_FILE", "").strip()
+MEDIA_COOKIES_FROM_BROWSER = os.getenv("MEDIA_COOKIES_FROM_BROWSER", "").strip().lower()
+
+# Voice input for Neural Desktop (backend/stt.py, POST /api/transcribe).
+# Electron has no working Web Speech API, so the desktop app records a short
+# clip and Whisper transcribes it locally (same faster-whisper install as
+# media analysis above -- one model in memory when the names match).
+#   STT_WHISPER_MODEL: "base" is fast on CPU (~0.5-1.5s per sentence);
+#     "small" is more accurate but roughly 3x slower.
+#   STT_LANGUAGE: "en" (default) is fastest and most reliable for English;
+#     set another code (e.g. "ur") or leave empty to auto-detect per clip.
+#   STT_INITIAL_PROMPT: words Whisper should expect (names, jargon).
+STT_WHISPER_MODEL = os.getenv("STT_WHISPER_MODEL", MEDIA_WHISPER_MODEL).strip() or "base"
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en").strip().lower()
+STT_INITIAL_PROMPT = os.getenv("STT_INITIAL_PROMPT", "Neural, Claude, Choco, Vercel, Buffer, YouTube.").strip()
+
 # Cheap "utility" tier for narrow, non-agentic background tasks (classify,
 # summarize, filter) — never the main conversational loop and never given
 # tools. See backend/utility.py and the plan doc's Core Engine section for
 # why this replaces a wholesale swap to Haiku.
 UTILITY_MODEL = os.getenv("UTILITY_MODEL", "claude-haiku-4-5-20251001")
+
+# Qwen is an optional *utility* provider, not a replacement for the Claude
+# Agent SDK.  It only receives isolated one-shot text requests from
+# utility.py; it has no tools, no conversation/session ownership, and no path
+# to start, inspect, or resume a job.  In auto mode Qwen is used when a valid
+# key is configured and Claude Haiku remains the safe fallback if Qwen is
+# unavailable.  Set UTILITY_PROVIDER=claude to keep the existing behavior,
+# or qwen to prefer Qwen while still retaining the Claude fallback.
+UTILITY_PROVIDER = os.getenv("UTILITY_PROVIDER", "auto").strip().lower()
+if UTILITY_PROVIDER not in {"auto", "claude", "qwen"}:
+    UTILITY_PROVIDER = "auto"
+# Qwen's own examples call this DASHSCOPE_API_KEY. Accept it as an alias so
+# a key copied from Model Studio works without renaming it, while QWEN_API_KEY
+# remains the clearer Neural-specific spelling.
+QWEN_API_KEY = os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "").rstrip("/")
+QWEN_UTILITY_MODEL = os.getenv("QWEN_UTILITY_MODEL", "qwen-flash")
+QWEN_ENABLED = bool(QWEN_API_KEY and QWEN_BASE_URL)
+UTILITY_TIMEOUT_SECONDS = float(os.getenv("UTILITY_TIMEOUT_SECONDS", "45"))
+
+# Qwen pricing is model/region-specific and changes independently of Neural.
+# Leave these at zero for usage-only dashboard reporting, or enter the live
+# USD-per-million-token rates shown in the Model Studio console to record an
+# estimate beside Claude's SDK-reported costs. They never affect routing.
+QWEN_INPUT_USD_PER_MILLION = float(os.getenv("QWEN_INPUT_USD_PER_MILLION", "0"))
+QWEN_OUTPUT_USD_PER_MILLION = float(os.getenv("QWEN_OUTPUT_USD_PER_MILLION", "0"))
 
 # How long main.py's _run_turn will wait for the NEXT message from an
 # in-progress turn before deciding the underlying session is wedged (a
@@ -131,6 +211,25 @@ UTILITY_MODEL = os.getenv("UTILITY_MODEL", "claude-haiku-4-5-20251001")
 # tool calls (a video re-encode, a slow page load) while still making a
 # real hang self-heal instead of requiring a manual restart.
 TURN_IDLE_TIMEOUT_SECONDS = int(os.getenv("TURN_IDLE_TIMEOUT_SECONDS", "300"))
+
+# Found live (Oct 2026): a video render/export/screen-recording tool call
+# that keeps producing periodic output -- progress notifications from
+# mcp-video's render, or `cap caps wait`/`cap export` streaming NDJSON
+# progress lines -- never looks "idle" to TURN_IDLE_TIMEOUT_SECONDS above,
+# because that one only measures the GAP between messages, not the
+# turn's total length. A tool that's actively ticking but will never
+# actually finish (a wedged ffmpeg filter graph, a Cap job stuck
+# server-side) could therefore hold the shared per-mode lock forever --
+# every other device/message just queues up behind it, looking to the
+# user like Neural is "still rendering" no matter how long they wait or
+# how many times they ask, since their new message never even starts
+# being processed. This is an ABSOLUTE ceiling on one turn's total
+# duration, independent of how much (or how little) silence there's
+# been -- see main.py's _iter_with_timeout's overall_deadline parameter.
+# Generous enough for a real multi-clip render with captions/narration,
+# but bounded so a wedged one self-heals same-session instead of taking
+# days.
+TURN_MAX_DURATION_SECONDS = int(os.getenv("TURN_MAX_DURATION_SECONDS", str(20 * 60)))
 
 # How long a turn gets to actually wrap up once the user explicitly
 # interrupts it (barge-in, or typing a new message while an old one is
@@ -154,7 +253,29 @@ TURN_IDLE_TIMEOUT_SECONDS = int(os.getenv("TURN_IDLE_TIMEOUT_SECONDS", "300"))
 # to discarding (see app.js's turn_id filtering, and this fix's sibling
 # in ws_endpoint's message loop that stops even STARTING a turn for a
 # message that's already been superseded by a newer one).
-POST_INTERRUPT_GRACE_SECONDS = int(os.getenv("POST_INTERRUPT_GRACE_SECONDS", "20"))
+POST_INTERRUPT_GRACE_SECONDS = int(os.getenv("POST_INTERRUPT_GRACE_SECONDS", "12"))
+
+# backend/process_watchdog.py's safety net underneath BOTH timeouts
+# above: even once a wedged turn is discarded at the SDK/conversation
+# level, the actual OS process it was waiting on (ffmpeg, the mcp-video
+# node process, or a `cap` CLI invocation) is a CHILD of the `claude` CLI
+# subprocess and is NOT guaranteed to die when that subprocess is torn
+# down -- disconnecting a parent process doesn't reliably kill still-
+# alive descendants, especially on Windows. Left alone, that orphan
+# keeps running (and consuming CPU) for however long it takes to fail on
+# its own, which for a truly wedged render/export can be indefinitely --
+# the literal mechanism behind "it's been rendering for days" even after
+# the chat itself has already recovered. VIDEO_RENDER_MAX_SECONDS is how
+# old one of Neural's own render/record/export processes (identified by
+# name + confirmed by its cwd being THIS project -- see
+# process_watchdog.py for why that check matters) has to be before the
+# watchdog kills its whole process tree; REAP_INTERVAL_SECONDS is how
+# often that sweep runs (see automations.py's start_scheduler). The
+# sweep also runs immediately, out of band, every time a turn is
+# discarded above, and once at startup, so a restart cleans up anything
+# already stuck without waiting for the next tick.
+VIDEO_RENDER_MAX_SECONDS = int(os.getenv("VIDEO_RENDER_MAX_SECONDS", str(30 * 60)))
+REAP_INTERVAL_SECONDS = int(os.getenv("REAP_INTERVAL_SECONDS", str(5 * 60)))
 
 # The claude-agent-sdk's own hard cap (ClaudeAgentOptions.max_buffer_size)
 # on a single JSON message read from the `claude` CLI's stdout before it
@@ -347,3 +468,27 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 # URL you actually control, not a placeholder -- see main.py's startup
 # check below, which warns loudly if this still looks like one.
 VAPID_CONTACT_EMAIL = os.getenv("VAPID_CONTACT_EMAIL") or "mailto:neural@localhost"
+
+
+# ---- Voice: how much is spoken, and the free fallback voices ------------
+# Only the opening of each reply is read aloud; the full text is always on
+# screen. Keeps voice conversational instead of reading long answers top to
+# bottom. Set SPEECH_OVERFLOW_NOTE= (empty) to drop the closing line.
+SPEECH_MAX_SENTENCES = int(os.getenv("SPEECH_MAX_SENTENCES", "2"))
+SPEECH_MAX_CHARS = int(os.getenv("SPEECH_MAX_CHARS", "300"))
+SPEECH_OVERFLOW_NOTE = os.getenv("SPEECH_OVERFLOW_NOTE", "The rest is on screen.")
+
+# After edge-tts fails (e.g. Microsoft changing its token, a 403), skip it
+# for this long instead of failing on every sentence.
+EDGE_TTS_RETRY_MINUTES = int(os.getenv("EDGE_TTS_RETRY_MINUTES", "30"))
+
+# Piper: free, offline neural voice (pip install piper-tts). The voice
+# downloads once into PIPER_VOICES_DIR. Female voices: en_US-amy-medium,
+# en_US-lessac-medium, en_US-hfc_female-medium, en_GB-jenny_dioco-medium.
+PIPER_ENABLED = os.getenv("PIPER_ENABLED", "true").lower() == "true"
+PIPER_VOICE = os.getenv("PIPER_VOICE", "en_US-amy-medium")
+PIPER_VOICES_DIR = os.getenv("PIPER_VOICES_DIR") or str(Path(__file__).resolve().parent.parent / "voices")
+
+# Windows built-in voice (last resort). Part of a name, e.g. "Zira";
+# empty picks the first female voice installed.
+WINDOWS_TTS_VOICE = os.getenv("WINDOWS_TTS_VOICE", "")

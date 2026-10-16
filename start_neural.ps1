@@ -32,6 +32,7 @@ function Stop-NeuralProcess($pattern) {
     Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -match 'uvicorn' -and
         $_.CommandLine -match $pattern -and
+        $_.CommandLine -notmatch '--port\s+879[78]' -and
         $_.CommandLine -notmatch 'Get-CimInstance' -and
         $_.Name -match 'uvicorn|python'
     } | ForEach-Object {
@@ -50,6 +51,37 @@ Stop-NeuralProcess 'backend\.main:app'
 Stop-NeuralProcess 'backend\.public_media_server:app'
 
 Start-Sleep 2
+
+# Neural's optional local Qwen utility sidecar speaks to Ollama on its
+# loopback-only OpenAI-compatible endpoint. Ollama is intentionally not
+# stopped above: it can serve other local apps too, and keeping it alive
+# preserves the loaded model between Neural restarts. If it is not already
+# running (after boot, for example), recover it here so Qwen utility calls
+# do not silently fall back merely because its local runtime was forgotten.
+function Test-OllamaServer {
+    try {
+        Invoke-WebRequest -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 2 -UseBasicParsing | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+if (-not (Test-OllamaServer)) {
+    $ollama = Get-Command ollama -ErrorAction SilentlyContinue
+    if ($ollama) {
+        Write-Host "== Starting local Ollama runtime for the Qwen utility sidecar =="
+        Start-Process -WindowStyle Hidden -FilePath $ollama.Source -ArgumentList 'serve'
+        for ($attempt = 0; $attempt -lt 5 -and -not (Test-OllamaServer); $attempt++) {
+            Start-Sleep 1
+        }
+        if (-not (Test-OllamaServer)) {
+            Write-Host "Ollama did not become ready; Neural will keep its Claude utility fallback available."
+        }
+    } else {
+        Write-Host "Ollama is not installed; Neural will keep its Claude utility fallback available."
+    }
+}
 
 Write-Host "== Starting main backend on port 8787 =="
 Start-Process -WindowStyle Hidden -FilePath "$PSScriptRoot\backend\.venv\Scripts\uvicorn.exe" `

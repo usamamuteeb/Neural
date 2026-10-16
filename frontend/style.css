@@ -430,6 +430,64 @@ button, input, select, textarea { font-family: inherit; }
   flex-shrink: 0;
 }
 
+.side-status { font-size: 0.58rem; letter-spacing: 0.08em; color: hsl(var(--state-hue) 70% 60%); }
+
+/* Closed by default so operational detail never competes with the main rail. */
+.ops-toggle { letter-spacing: 0.12em; }
+.ops-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: rgba(1, 5, 7, 0.42);
+  backdrop-filter: blur(2px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease;
+}
+.ops-backdrop.show { opacity: 1; pointer-events: auto; }
+.ops-panel {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  bottom: 14px;
+  z-index: 11;
+  width: min(388px, calc(100vw - 28px));
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 19px;
+  border: 1px solid rgba(151, 225, 234, 0.19);
+  border-radius: 14px;
+  background: linear-gradient(160deg, rgba(13, 28, 31, 0.98), rgba(5, 12, 14, 0.99));
+  box-shadow: -18px 24px 65px rgba(0, 0, 0, 0.52), 0 0 32px hsla(var(--state-hue), 70%, 50%, 0.1);
+  transform: translateX(calc(100% + 28px));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+}
+.ops-panel.open { transform: translateX(0); opacity: 1; pointer-events: auto; }
+.ops-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.ops-panel-head .side-label { padding-bottom: 3px; }
+.ops-subtitle { color: var(--muted-dim); font-size: 0.68rem; }
+.ops-close { width: 28px; height: 28px; border: 1px solid rgba(255,255,255,0.12); border-radius: 50%; font-size: 0.9rem; }
+.ops-live { margin: 14px 0 10px; padding-bottom: 9px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.ops-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.ops-summary span { min-width: 0; padding: 8px 4px; background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.07); color: var(--muted); font-size: 0.62rem; text-align: center; }
+.ops-summary b { display: block; overflow: hidden; color: var(--text); font-size: 0.78rem; text-overflow: ellipsis; }
+.ops-section { margin-top: 15px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.07); }
+.ops-section > span { display: block; color: var(--muted-dim); font-size: 0.58rem; letter-spacing: 0.13em; margin-bottom: 7px; }
+.ops-grid { display: flex; flex-wrap: wrap; gap: 5px; }
+.ops-health { border: 1px solid rgba(255,255,255,0.1); color: var(--muted); padding: 4px 6px; font-size: 0.63rem; }
+.ops-health.ok { color: #4ade80; border-color: rgba(74,222,128,0.26); }
+.ops-list { max-height: min(190px, 28vh); overflow-y: auto; overscroll-behavior: contain; }
+.ops-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 7px; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.055); color: var(--muted); font-size: 0.68rem; }
+.ops-row span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ops-row.active span:first-child { color: #4ade80; }
+.ops-row.failure span { color: var(--danger); }
+.ops-utility .ops-row { grid-template-columns: 62px minmax(0, 1fr) auto; }
+.ops-utility .ops-row span:first-child { color: hsl(var(--state-hue) 70% 64%); }
+
 .side-list {
   flex: 1;
   overflow-y: auto;
@@ -671,6 +729,7 @@ button, input, select, textarea { font-family: inherit; }
     background: #070c0e;
     border-left: 1px solid rgba(255, 255, 255, 0.1);
     padding: max(64px, calc(env(safe-area-inset-top) + 56px)) 18px calc(18px + env(safe-area-inset-bottom));
+    overflow-y: auto;
     box-shadow: -18px 0 40px rgba(0, 0, 0, 0.4);
     transform: translateX(105%);
     transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -680,7 +739,24 @@ button, input, select, textarea { font-family: inherit; }
   }
   .side-col.open { transform: translateX(0); }
 
+  /* The drawer contains only main-screen content. Its own scroll boundary
+     avoids nested-content overlap on short displays. */
+  .side-block { flex: none !important; }
+  #block-activity { max-height: 220px; }
+  #block-activity .side-list { flex: none; max-height: 184px; }
+
   #block-automations { border-top: 1px solid rgba(255, 255, 255, 0.07); border-left: none; padding-top: 14px; padding-left: 0; }
+
+  .ops-panel {
+    top: 8px;
+    right: 8px;
+    bottom: 8px;
+    width: calc(100vw - 16px);
+    padding: 17px;
+    border-radius: 12px;
+  }
+  .ops-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .ops-list { max-height: min(200px, 32vh); }
 
   /* Automation modal becomes a bottom sheet -- easier to reach one-handed */
   .modal-backdrop { align-items: flex-end; }
@@ -704,7 +780,257 @@ button, input, select, textarea { font-family: inherit; }
 }
 
 @media (max-width: 420px) {
-  .brand { letter-spacing: 0.28em; font-size: 0.85rem; }
+  .topbar { align-items: flex-start; gap: 8px; }
+  .brand { letter-spacing: 0.28em; font-size: 0.85rem; padding-top: 7px; }
+  .topbar-right { max-width: calc(100% - 104px); flex-wrap: wrap; justify-content: flex-end; row-gap: 6px; }
+  .topbar-right .pill { padding: 6px 9px; }
   .orb { width: 78px; height: 78px; }
   .side-col { width: 90vw; }
+}
+
+/* =====================================================================
+   Avatar upgrade (Oct 2026): Neural's animated anime-style avatar
+   (frontend/avatar.js), the vision attach UI, and markdown in replies.
+   Appended last so these rules win over the older orb-stage rules above.
+   ===================================================================== */
+
+/* ---------------- Avatar column ---------------- */
+
+.avatar-col {
+  position: relative;
+  flex: 0 0 clamp(250px, 26vw, 400px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
+.avatar-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 400 / 520;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: calc(100% - 26px);
+}
+
+/* With the avatar running, her own SVG draws the HUD halo (rings,
+   orbiting particles, mode-switch burst) so it always lines up with her
+   head at any size. The standalone orb stays in the page only as the
+   fallback if avatar.js ever fails to load. */
+.avatar-stage.has-avatar .orb { display: none; }
+
+.avatar-mount { position: absolute; inset: 0; z-index: 1; }
+
+/* The old orb, now a holographic halo behind her head. */
+.avatar-stage .orb {
+  position: absolute;
+  z-index: 0;
+  width: 84%;
+  height: auto;
+  aspect-ratio: 1;
+  left: 8%;
+  top: 3%;
+  opacity: 0.6;
+  pointer-events: none;
+}
+.avatar-stage .orb-core { inset: 24%; opacity: 0.3; filter: blur(20px); }
+.avatar-stage .orb-ring { border-width: 1.5px; }
+.avatar-stage .orb-particles span:nth-child(1) { --r: 118px; }
+.avatar-stage .orb-particles span:nth-child(2) { --r: 136px; }
+.avatar-stage .orb-particles span:nth-child(3) { --r: 104px; }
+.avatar-stage .orb-particles span:nth-child(4) { --r: 148px; }
+.avatar-stage .orb-particles span:nth-child(5) { --r: 126px; }
+.avatar-stage .orb-particles span:nth-child(6) { --r: 96px; }
+
+.avatar-col .orb-label { margin-top: 2px; }
+
+.chat-col { position: relative; }
+
+@media (max-width: 1100px) and (min-width: 761px) {
+  .stage { gap: 18px; padding: 4px 18px 18px; }
+  .avatar-col { flex-basis: 210px; }
+  .side-col { max-width: 250px; }
+}
+
+/* ---------------- Vision: attach menu, previews, drop target ---------------- */
+
+.attach-wrap { position: relative; display: flex; }
+
+.attach-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  min-width: 214px;
+  padding: 6px;
+  background: linear-gradient(160deg, rgba(13, 28, 31, 0.98), rgba(5, 12, 14, 0.99));
+  border: 1px solid hsla(var(--state-hue), 70%, 55%, 0.35);
+  border-radius: 12px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5), 0 0 24px hsla(var(--state-hue), 70%, 50%, 0.12);
+}
+.attach-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.92rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.attach-menu button:hover,
+.attach-menu button:focus-visible {
+  background: hsla(var(--state-hue), 70%, 50%, 0.12);
+  color: hsl(var(--state-hue) 85% 75%);
+  outline: none;
+}
+.attach-menu button svg { color: hsl(var(--state-hue) 80% 65%); flex-shrink: 0; }
+.attach-btn.has-items { color: hsl(var(--state-hue) 85% 72%); border-color: hsl(var(--state-hue) 70% 55%); }
+
+.attach-strip {
+  display: flex;
+  gap: 8px;
+  padding: 8px 2px 4px;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+.attach-thumb {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  overflow: hidden;
+  flex-shrink: 0;
+  border: 1px solid hsla(var(--state-hue), 70%, 55%, 0.45);
+  animation: msg-in 0.2s ease;
+}
+.attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attach-thumb .attach-kind {
+  position: absolute;
+  left: 4px;
+  bottom: 3px;
+  font-size: 0.55rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #fff;
+  text-shadow: 0 1px 3px #000;
+}
+.attach-thumb button {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 0;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 11px;
+  line-height: 20px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.msg-images { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-bottom: 6px; }
+.msg-images img {
+  width: 120px;
+  max-height: 120px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid hsla(var(--state-hue), 70%, 55%, 0.4);
+}
+
+.drop-hint {
+  position: absolute;
+  inset: 44px 0 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed hsl(var(--state-hue) 70% 55%);
+  border-radius: 16px;
+  background: hsla(var(--state-hue), 70%, 40%, 0.14);
+  color: hsl(var(--state-hue) 85% 75%);
+  font-family: var(--font-display);
+  letter-spacing: 0.2em;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+  z-index: 5;
+}
+.chat-col.dragging .drop-hint { opacity: 1; }
+
+.camera-modal video {
+  width: 100%;
+  max-height: 60vh;
+  border-radius: 12px;
+  background: #000;
+  display: block;
+  margin-bottom: 12px;
+}
+
+/* ---------------- Markdown inside replies ---------------- */
+
+.msg.assistant p { margin: 0 0 0.5em; }
+.msg.assistant p:last-child { margin-bottom: 0; }
+.msg code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.86em;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.msg pre {
+  background: rgba(0, 0, 0, 0.38);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 6px 0;
+  white-space: pre;
+}
+.msg pre code { background: none; padding: 0; font-size: 0.84em; }
+.msg ul, .msg ol { margin: 4px 0 6px; padding-left: 20px; }
+.msg li { margin: 2px 0; }
+.msg a { color: hsl(var(--state-hue) 85% 70%); }
+.msg strong { color: #fff; font-weight: 700; }
+
+/* ---------------- Mobile ---------------- */
+
+@media (max-width: 760px) {
+  .stage { flex-direction: column; }
+  .avatar-col {
+    flex: 0 0 auto;
+    width: 100%;
+    height: clamp(150px, 27vh, 240px);
+    margin-bottom: 8px;
+  }
+  .avatar-stage { max-height: none; aspect-ratio: auto; flex: 1 1 auto; }
+  .avatar-stage .orb {
+    width: min(92%, calc(clamp(150px, 27vh, 240px) * 0.86));
+    left: 0;
+    right: 0;
+    margin: 0 auto;
+    top: 2%;
+  }
+  .avatar-stage .orb-particles span:nth-child(1) { --r: 70px; }
+  .avatar-stage .orb-particles span:nth-child(2) { --r: 84px; }
+  .avatar-stage .orb-particles span:nth-child(3) { --r: 62px; }
+  .avatar-stage .orb-particles span:nth-child(4) { --r: 92px; }
+  .avatar-stage .orb-particles span:nth-child(5) { --r: 78px; }
+  .avatar-stage .orb-particles span:nth-child(6) { --r: 56px; }
+  .avatar-col .orb-label { margin-top: 0; font-size: 0.58rem; }
+  .avatar-col .nv-chip { font-size: 0.64rem; top: 0; }
+  .attach-btn { width: 44px; height: 44px; }
+  .attach-menu { min-width: 200px; }
+  .msg-images img { width: 96px; max-height: 96px; }
 }

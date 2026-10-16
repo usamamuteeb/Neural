@@ -14,6 +14,7 @@ function Stop-NeuralProcess($pattern) {
     Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -match 'uvicorn' -and
         $_.CommandLine -match $pattern -and
+        $_.CommandLine -notmatch '--port\s+879[78]' -and
         $_.CommandLine -notmatch 'Get-CimInstance' -and
         $_.Name -match 'uvicorn|python'
     } | ForEach-Object {

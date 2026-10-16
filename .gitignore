@@ -12,6 +12,7 @@ media/
 memory/
 automations.json
 session_state.json
+audit.jsonl
 output/
 tutor_memory/
 tutor_knowledge/
@@ -35,3 +36,16 @@ test.mp3
 # Separate personal project Neural has built inside this folder (its own
 # app, with its own nested git repo) -- not part of Neural itself.
 projects/
+
+# Playwright page snapshots dumped into the root by browser tools
+snapshot-*.yml
+
+# Local backup copies of edited files
+*.bak
+*.bak-*
+
+# Piper voice models (downloaded on first start, ~60 MB each)
+voices/
+
+# Claude Code's per-machine settings
+.claude/settings.local.json

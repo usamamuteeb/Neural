@@ -38,9 +38,13 @@ Architecture Plan" doc for the full design and open questions.
   - `gmail_calendar.py` / `google_auth.py` — Gmail + Calendar via the
     classic REST APIs (not Google's Workspace-only MCP gateway, which
     personal accounts can't use) using your existing OAuth credentials.
-  - `tts.py` — three-tier voice: `edge-tts` (free neural voices, primary),
-    ElevenLabs (optional paid middle tier, off by default -- past billing
-    issues), then local `pyttsx3` as the always-works last resort.
+  - `tts.py` — voice chain: `edge-tts` (free, primary; paused 30 min
+    after a failure such as Microsoft's Oct 2026 403s), ElevenLabs
+    (optional, off), Piper (free offline neural voice, `pip install
+    piper-tts`), then the Windows voice in a separate process. Errors are
+    reported once, not per sentence. `speech_budget.py` speaks only the
+    first 2 sentences of a reply (`SPEECH_MAX_SENTENCES`); the rest stays
+    on screen.
   - `push.py` — Web Push (VAPID) to the phone/desktop: generates and
     persists its own VAPID keypair on first run, stores browser
     subscriptions in `Neural/push_subscriptions.json`, sends via
@@ -213,6 +217,49 @@ each process by hand. Two scripts fix that:
   in a PowerShell window on this PC -- it can't be done from a chat
   session that only has file access to this repo.
 
+## Optional Qwen utility sidecar
+
+Qwen is deliberately **not** wired into Neural's main Claude Agent SDK
+conversation or its browser/shell/file integrations. It is a one-request,
+one-response sidecar for stateless utility work such as documentation
+summaries. It cannot receive tools, persistent chat context, job ownership,
+or permission to start/resume a video render. A Qwen error or timeout falls
+back automatically to the existing Claude utility model, so a provider outage
+cannot strand a chat turn.
+
+To enable it, create a Qwen Model Studio API key and choose the endpoint for
+the same region/workspace. Add the following to your private `.env`, then
+restart Neural:
+
+```
+UTILITY_PROVIDER=auto
+QWEN_API_KEY=your_model_studio_key
+QWEN_BASE_URL=https://your-region-compatible-mode-url/v1
+QWEN_UTILITY_MODEL=qwen-flash
+```
+
+`DASHSCOPE_API_KEY` is also accepted if you prefer Qwen's standard variable
+name. Keep `UTILITY_PROVIDER=auto`: it selects Qwen only when the key and
+endpoint are present and otherwise preserves the existing Claude utility
+path. Do not place either key in the frontend or share it in chat.
+
+The Operations panel reports whether Qwen is configured, which utility
+provider was selected, call counts, token use, failures, and an optional
+cost estimate. Pricing differs by Qwen model and region, so set
+`QWEN_INPUT_USD_PER_MILLION` and `QWEN_OUTPUT_USD_PER_MILLION` only after
+copying the live rates from your Model Studio console; leaving them at `0`
+keeps accurate usage reporting without an invented price.
+
+### Local Qwen without billing
+
+Neural also supports a local Ollama model through its OpenAI-compatible
+endpoint. This is the recommended option on a machine where you do not want
+to attach a payment method. After `ollama serve` is available and a Qwen
+model is installed, use `QWEN_BASE_URL=http://127.0.0.1:11434/v1`, set
+`QWEN_API_KEY=local-ollama` (a local placeholder, never a cloud credential),
+and set `QWEN_UTILITY_MODEL` to the exact installed Ollama model tag. Every
+later `start_neural.ps1` run checks for Ollama and starts it if necessary.
+
 ## Mobile access
 
 The UI is responsive: on a phone-width screen the Activity/Automations
@@ -306,6 +353,112 @@ above) re-asserts both every time it runs, including automatically after
 a reboot if you've set up `setup_autostart.ps1`.
 
 **Known limitation: Funnel media fetch reliability.** Tailscale's own docs say plainly that traffic sent over a Funnel "is subject to non-configurable bandwidth limits" -- there's no setting to raise it. In practice this can show up as Buffer intermittently failing to fetch a video you just posted a link to, even though the file is completely fine (correct H.264/AAC, well under Buffer's size limits, and the exact same link Neural's own requests fetch successfully). The fetch just doesn't complete reliably every time over the funnel path -- it's not deterministic and isn't tied to file size in any simple way (an 18MB file can succeed while a 10MB one from the same batch fails). If it happens, the fix is patience, not a smaller file -- Neural retries the same link a couple of times before giving up, and if it's still failing you can just ask again in a few minutes or let it go out at its next scheduled slot. If this becomes a frequent problem, the real fix would be swapping Funnel for a proper CDN/object-storage host for outbound media (so Buffer fetches from there instead of from this PC's own home connection) -- worth considering if repeated failures get annoying, but not something set up by default.
+
+## Speed, token diet & background jobs
+
+**Fewer tokens every turn.** The chat system prompt went from ~8k tokens
+to ~3.4k. Specialist how-tos (Buffer/social posting, Cap screen recording,
+video editing, image editing, Vercel, meal planning, job search, ATS
+resumes) now live in `backend/playbooks/*.md` and are loaded with the
+`read_playbook` tool only when a task needs one (`backend/playbooks.py`).
+Automations and background workers still get every playbook inlined, so
+their behavior is unchanged. Extended thinking is off for spoken chat
+turns (`CHAT_THINKING=default` in `.env` turns it back on).
+
+**Browser on a diet** (`backend/browser_efficiency.py`). Every browser
+action used to produce a full page tree (median ~10KB, up to ~86KB) that
+the model then read. Now a hook appends a compact digest of the page's
+interactive elements (ref, role, name) -- about 6-17x smaller -- so it
+can click/type without reading the tree; a bare `browser_snapshot` is
+saved to a file and digested the same way. Playwright runs with
+`--console-level error --codegen none`, and `.playwright-mcp/` snapshots
+and logs older than 2 days are pruned automatically (it had grown to
+~1000 files / 49MB).
+
+**Talks like a person.**
+- Replies are spoken *while* they're being written: the first sentence
+  starts playing before the rest is generated (`backend/speech_stream.py`).
+- Interrupting her is instant: a new message no longer waits for the old
+  reply's remaining audio to finish synthesizing (measured 2.5s -> 0.17s
+  in testing).
+- Starting to talk while she's speaking cuts her off; her own voice
+  echoing from the speakers is recognized and ignored, so she doesn't
+  interrupt herself or answer her own sentences. A stray noise while
+  she's *working* no longer cancels the work -- only your finished
+  sentence does. Pressing the mic stops her voice but doesn't throw away
+  a half-done task.
+- "hi" / "thanks" / "ok" get an instant, spoken reply with no model turn.
+
+**Background jobs** (`backend/background.py`). For long work -- multi-step
+browsing, renders, multi-site research -- Neural starts a managed
+background job and keeps talking with you. Jobs run in a separate,
+isolated session with hard limits (`JOB_MAX_SECONDS`, default 25 min;
+`JOB_IDLE_TIMEOUT_SECONDS`, 10 min; `MAX_BACKGROUND_JOBS`, 2), clean up
+their own ffmpeg/Cap processes on timeout or cancel, can't spawn more
+jobs, and show up in the activity feed, the OPS panel, and on the avatar
+("Background: ..."). The result is written into chat, spoken, pushed to
+your phone, and noted to Neural's next turn so "what did you find?"
+works. Ask her to list or cancel jobs any time. Interrupting her voice
+never touches a running job. Detached shell jobs and Task workers stay
+blocked as before.
+
+**Fixed along the way:** automations had no time limit at all (a stuck
+tool call hung the run, and its processes, forever) -- they now use the
+same limits and cleanup as jobs (`AUTOMATION_MAX_SECONDS`,
+`AUTOMATION_IDLE_TIMEOUT_SECONDS`); the ATS resume skill was unreachable
+from chat since skills were disabled for isolation -- it's served as a
+playbook now.
+
+## Avatar & vision
+
+Neural has a face now: an original animated anime-style girl drawn
+entirely in code (`frontend/avatar.js` -- inline SVG plus a small
+animation loop). No downloaded models, no Live2D/VRM runtime, no
+third-party art, no paid service -- nothing to install or license.
+
+What she does:
+
+- **Lives on screen**: breathes, blinks (sometimes twice), sways her hair
+  on a spring, glances around when idle, and follows your cursor with her
+  eyes. Desktop shows her in her own column left of the chat; on a phone
+  she's a compact bust above it.
+- **Shows what Neural is doing**: leans in with sound waves at her
+  headset while listening, looks up with a thought bubble while thinking,
+  dozes off ("z z z") when the backend is offline. A small status chip
+  above her says what she's actually doing right now ("Browsing the web",
+  "Running a command", "Looking at your image", ...), driven by the live
+  activity feed. Her eye color and HUD halo follow the same state colors
+  as the rest of the UI.
+- **Talks**: real lip-sync -- her mouth follows the actual TTS audio level
+  (a Web Audio analyser on the reply audio), whichever voice engine
+  produced it.
+- **Has feelings about it**: both system prompts ask Claude to open every
+  reply with one tag like `[mood:happy]` (neutral, happy, excited,
+  playful, proud, surprised, curious, worried, sad, embarrassed,
+  affectionate, annoyed). `backend/mood.py` strips it before the text is
+  shown, spoken, saved, or pushed as a notification, and sends it to the
+  UI as her expression -- sparkles when she's excited, a sweat drop when
+  something went wrong, hearts when you're nice to her.
+- **Headpats**: click/tap her head.
+- **Tutor mode**: she puts on glasses.
+
+If `avatar.js` ever fails to load, the old orb comes back automatically
+and everything else works as before. `window.neuralAvatar` is exposed in
+the browser console if you want to poke at her (`neuralAvatar.setMood("excited")`).
+
+**Vision** -- show Neural things. The paperclip button next to the mic
+offers *Photo or image file*, *Look at my screen* (one frame from your
+browser's screen-share picker, nothing keeps recording -- desktop
+browsers only), and *Take a photo* (camera). You can also paste an image
+(Ctrl+V) or drag one onto the chat. Up to 4 per message, with or without
+text -- or attach one and then just *ask out loud* "what's this?". Images
+are downscaled in the browser, saved under `media/uploads/` (validated,
+size-capped, auto-deleted after 7 days -- see `backend/attachments.py`),
+and Claude opens them with its own Read tool. Same Claude subscription,
+no vision API key, no extra cost.
+
+Replies also render light markdown now (code blocks, inline code, bold,
+lists, links) -- mostly useful in Tutor mode.
 
 ## Voice
 
@@ -629,6 +782,34 @@ results. Free tier is capped at a few hundred calls/day -- check your own
 developer.adzuna.com dashboard for the current number rather than
 trusting a remembered figure here.
 
+## Neural Desktop (floating companion)
+
+`desktop/` is an always-on-top desktop companion: Neural's avatar floats over your apps, you talk (hold Space / Right Ctrl, or Ctrl+Alt+Space) or type, and she knows which window you're in -- "what does this error mean?" just works, "my screen" attaches a screenshot of that window, "what I copied" attaches your clipboard, and hovering her shows one-tap suggestions for the current app. Time, reminders/timers, opening apps and finding files are answered instantly on the desktop with no model turn. It's a thin client of this backend (same conversation, your Claude subscription, no API keys); voice input is transcribed locally by Whisper via `POST /api/transcribe`.
+
+Start it with `desktop\Start Neural Desktop.bat` (needs Node.js; the first run installs Electron). For voice: `backend\.venv\Scripts\python.exe -m pip install -U faster-whisper`, then restart Neural. Full guide: [desktop/README.md](desktop/README.md).
+
+## Social media & video links
+
+Paste any post or video link (YouTube, Shorts, TikTok, Instagram, X/Twitter, Facebook, LinkedIn, Reddit, Vimeo, Twitch clips and about 1,800 other sites) and ask "what's this about?" or "how do I do this?". Neural calls `analyze_media_link` (backend/media_analysis.py), which gathers, all locally and free:
+
+- **Metadata**: title, creator, date, length, views/likes, the post's caption/description, tags, chapters.
+- **What's said**: the platform's own captions when they exist. Otherwise the audio is transcribed on your PC with Whisper (no API key, offline after a one-time model download).
+- **What's shown**: a few still frames (or exact moments, e.g. "show me 1:23") that Neural looks at with its own vision, so UI, code and settings on screen are understood, not just the voice-over.
+
+For a video about a new feature or tool, the `media-analysis` playbook makes Neural check the official docs or changelog, say whether it's actually available (and on which plan, region or platform), give step-by-step instructions, and tell you whether it could be added to your own projects, then offer to build it. Text-only, image and login-gated posts fall back to the browser tools.
+
+Results are cached in `media/analysis/` for 7 days, so follow-up questions are instant. The full transcript is saved there in `analysis.md`.
+
+**One-time setup** (in the backend's venv):
+
+```
+backend\.venv\Scripts\python.exe -m pip install -U yt-dlp faster-whisper
+```
+
+If `faster-whisper` won't install on your Python version, use `openai-whisper` instead. Frames use `ffmpeg` if it's on PATH, otherwise PyAV (installed with faster-whisper). Keep yt-dlp updated (same command) when a site stops working; sites change often.
+
+Optional `.env` settings: `MEDIA_WHISPER_MODEL` (tiny/base/small/medium; bigger is more accurate but slower), `MEDIA_MAX_TRANSCRIBE_MINUTES`, `MEDIA_MAX_DOWNLOAD_MINUTES`, and `MEDIA_COOKIES_FROM_BROWSER=firefox` (or chrome/edge) for Instagram/Facebook posts that need a login.
+
 ## Resume writing (ATS-compliant)
 
 Ask Neural to write, update, or tailor a resume/CV -- from scratch, from
@@ -924,7 +1105,7 @@ Three layers, in the order they're worth setting up:
    automatically re-fetches once the cache entry is older than
    `TUTOR_DOCS_CACHE_DAYS` (14 by default -- change it in `.env`). No
    setup, no API key -- it's just an HTTP fetch plus the existing cheap
-   Haiku utility tier for summarizing (see `backend/utility.py`).
+   Haiku/Qwen utility tier for summarizing (see `backend/utility.py`).
 
 2. **Session memory** (`backend/tutor_memory.py` + `backend/tutor.py`) --
    Tutor mode keeps its own memory files under `tutor_memory/`,

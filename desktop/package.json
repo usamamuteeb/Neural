@@ -1,0 +1,17 @@
+{
+  "name": "neural-desktop",
+  "version": "1.0.0",
+  "description": "Neural's always-on-top desktop companion -- a thin client for the local Neural backend (Claude subscription, no API keys).",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/run.js"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0"
+  },
+  "optionalDependencies": {
+    "uiohook-napi": "^1.5.4"
+  }
+}

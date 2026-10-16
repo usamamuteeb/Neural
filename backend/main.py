@@ -24,17 +24,21 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeSDKClient,
     ResultMessage,
+    StreamEvent,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import automations, backup, config, media, push, session_state, tts
+from . import attachments, automations, background, backup, config, media, observability, process_watchdog, push, session_state, stt, tts, utility
+from .mood import extract_mood
+from .speech_budget import SpeechBudget
+from .speech_stream import TextStreamer
 from .agent import new_client, wrap_for_voice
 from .events import bus
 
@@ -156,32 +160,60 @@ async def _iter_with_timeout(
     interrupt_event: "asyncio.Event | None" = None,
     grace_seconds: float = 20,
     poll_interval: float = 1.0,
+    overall_deadline: "float | None" = None,
 ):
     """Wrap an async iterator so a stalled upstream can't block forever.
     Used by _run_turn to bound how long it waits for the NEXT message
     from an in-progress turn (see config.TURN_IDLE_TIMEOUT_SECONDS).
     Raises asyncio.TimeoutError if nothing arrives within `timeout`
-    seconds of the previous item (or of starting).
+    seconds of the previous item (or of starting) -- OR if `overall_deadline`
+    (an absolute asyncio loop-clock deadline) is reached, whichever comes
+    first.
+
+    Found live (Oct 2026): `timeout` alone only measures the GAP between
+    messages, so a tool call that keeps producing periodic output --
+    progress notifications from a video render/export, for instance --
+    never looks "idle" no matter how long it runs for or whether it will
+    ever actually finish; it would run forever, holding whatever lock the
+    caller holds for the whole time. `overall_deadline` is the fix: a hard
+    ceiling on the TOTAL time this generator is allowed to keep running,
+    independent of how recently the last item arrived. See
+    config.TURN_MAX_DURATION_SECONDS and _run_turn below, which computes
+    this once per turn and passes it through.
 
     If `interrupt_event` is given, waiting for that NEXT item is polled
     in short `poll_interval` slices (via asyncio.shield, so the real
     underlying wait is never itself cancelled/restarted -- only this
     function's OWN patience for it is re-evaluated each slice) instead of
-    one long wait_for. The moment the event becomes set mid-wait, the
-    remaining deadline is replaced with `grace_seconds` from THAT moment,
-    rather than whatever was left of `timeout` -- so an explicit user
-    interrupt can cut short a wait that's already deep into a long
-    `timeout`, not just affect waits that haven't started yet. This is
-    what actually bounds a turn stuck inside a tool call client.
-    interrupt() can't preempt (see config.POST_INTERRUPT_GRACE_SECONDS)."""
+    one long wait_for. The moment the event becomes set, one fixed
+    `grace_seconds` deadline is started and carried across *every* later
+    progress message. This is important for video tools: progress output
+    must not keep renewing an interrupt timeout forever.
+    overall_deadline, when set, can only ever shrink this further, never
+    extend past it -- a user interrupt still can't buy MORE time than the
+    turn's own absolute ceiling already allows."""
     it = aiter.__aiter__()
+    interrupt_deadline: float | None = None
     while True:
         next_task = asyncio.ensure_future(it.__anext__())
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        if (
+            interrupt_event is not None
+            and interrupt_event.is_set()
+            and interrupt_deadline is None
+        ):
+            interrupt_deadline = loop.time() + grace_seconds
+        if interrupt_deadline is not None and interrupt_deadline < deadline:
+            deadline = interrupt_deadline
+        if overall_deadline is not None and overall_deadline < deadline:
+            deadline = overall_deadline
         try:
             if interrupt_event is None:
-                item = await asyncio.wait_for(next_task, timeout=timeout)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                item = await asyncio.wait_for(next_task, timeout=remaining)
             else:
                 while True:
                     remaining = deadline - loop.time()
@@ -193,10 +225,10 @@ async def _iter_with_timeout(
                         )
                         break
                     except asyncio.TimeoutError:
-                        if interrupt_event.is_set():
-                            grace_deadline = loop.time() + grace_seconds
-                            if grace_deadline < deadline:
-                                deadline = grace_deadline
+                        if interrupt_event.is_set() and interrupt_deadline is None:
+                            interrupt_deadline = loop.time() + grace_seconds
+                        if interrupt_deadline is not None and interrupt_deadline < deadline:
+                            deadline = interrupt_deadline
                         continue
         except asyncio.TimeoutError:
             next_task.cancel()
@@ -215,6 +247,10 @@ async def _run_turn(text: str, mode: str = "chat"):
     websocket."""
     lock = _chat_locks[mode]
     async with lock:
+        # Always define this before querying. A normal query that later
+        # times out used to reach the recovery path below without a
+        # snapshot, so its ffmpeg/Cap child could survive the reset.
+        render_processes: list[dict] = []
         client = _shared_clients[mode]
         if client is None:
             client = await _new_client_resuming(mode)
@@ -228,6 +264,17 @@ async def _run_turn(text: str, mode: str = "chat"):
             await client.query(text)
         except Exception as e:
             logger.error("Shared %s client query failed, reconnecting: %s", mode, e)
+            # Take an ownership snapshot while this client's ``claude``
+            # subprocess still exists.  The immediate cleanup after
+            # disconnect must never sweep every young ffmpeg/cap/node process
+            # in the project: Tutor mode and scheduled automations may have a
+            # separate, healthy render running at the same time.
+            try:
+                render_processes = process_watchdog.snapshot_client_render_processes(client)
+            except Exception as exc:  # noqa: BLE001 -- conservative reaper remains the fallback
+                logger.error("Could not snapshot timed-out client's render processes: %s", exc)
+                render_processes = []
+
             try:
                 await client.disconnect()
             except Exception:  # noqa: BLE001
@@ -236,20 +283,27 @@ async def _run_turn(text: str, mode: str = "chat"):
             _shared_clients[mode] = client
             await client.query(text)
 
+        turn_deadline = asyncio.get_running_loop().time() + config.TURN_MAX_DURATION_SECONDS
         try:
             async for msg in _iter_with_timeout(
                 client.receive_response(),
                 config.TURN_IDLE_TIMEOUT_SECONDS,
                 interrupt_event=_interrupt_events[mode],
                 grace_seconds=config.POST_INTERRUPT_GRACE_SECONDS,
+                overall_deadline=turn_deadline,
             ):
-                if isinstance(msg, ResultMessage) and msg.session_id:
+                if (
+                    isinstance(msg, ResultMessage)
+                    and msg.session_id
+                    and not _interrupt_events[mode].is_set()
+                ):
                     # Only a turn that actually completed reaches here, so
                     # this can never checkpoint a wedged/broken session --
                     # see session_state.py.
                     session_state.save_session_id(mode, msg.session_id)
                 yield msg
         except asyncio.TimeoutError:
+            hit_overall_ceiling = asyncio.get_running_loop().time() >= turn_deadline - 1
             if _interrupt_events[mode].is_set():
                 logger.error(
                     "%s was interrupted but stayed stuck (likely a tool call already "
@@ -258,6 +312,17 @@ async def _run_turn(text: str, mode: str = "chat"):
                     "period -- discarding it so the NEXT message gets a working "
                     "client instead of waiting out whatever that tool call was doing.",
                     mode, config.POST_INTERRUPT_GRACE_SECONDS,
+                )
+            elif hit_overall_ceiling:
+                logger.error(
+                    "%s turn ran past its %ds absolute ceiling (TURN_MAX_DURATION_SECONDS) "
+                    "even though it was still producing output -- a tool call that keeps "
+                    "emitting progress but never actually finishes (a wedged render/export/ "
+                    "recording is the known case -- see process_watchdog.py) would otherwise "
+                    "hold this lock forever since it never looks \"idle\". Discarding it so "
+                    "the NEXT message gets a working client instead of queueing behind this "
+                    "one indefinitely.",
+                    mode, config.TURN_MAX_DURATION_SECONDS,
                 )
             else:
                 logger.error(
@@ -272,9 +337,27 @@ async def _run_turn(text: str, mode: str = "chat"):
             except Exception:  # noqa: BLE001
                 pass
             _shared_clients[mode] = None
+
+            # The SDK/conversation side is now recovered -- but whatever
+            # OS process that stuck tool call was waiting on can outlive the
+            # `claude` CLI subprocess just disconnected above. Kill only the
+            # video descendants snapshotted from THIS client, never another
+            # active mode or automation's render. The periodic watchdog still
+            # catches genuinely old orphans that could not be snapshotted.
+            try:
+                killed = await asyncio.to_thread(
+                    process_watchdog.kill_snapshotted_processes, render_processes
+                )
+                for item in killed:
+                    bus.publish({"type": "watchdog_kill", "mode": mode, **item})
+            except Exception as exc:  # noqa: BLE001 -- the reap is a bonus, never let it block recovery
+                logger.error("process_watchdog sweep failed: %s", exc)
+
             raise RuntimeError(
                 "That took too long to respond, so I had to reset this session. "
-                "Please try again -- if it just spoke, that reply may have been cut short."
+                "Please try again -- if it just spoke, that reply may have been cut short. "
+                "If it was rendering or recording something, that job has been stopped -- "
+                "it won't keep running in the background."
             ) from None
 
 
@@ -350,7 +433,7 @@ async def _end_tutor_session() -> None:
                 pass
             _shared_clients["tutor"] = None
 
-    summary_text = summary_text.strip()
+    summary_text = extract_mood(summary_text)[0].strip()
     if summary_text:
         # Written straight to history, not broadcast live -- by the time
         # this fires, whoever ended the session has likely already
@@ -385,7 +468,9 @@ async def _broadcast(obj: dict) -> None:
             pass
 
 
-async def deliver_assistant_message(text: str, source: str = "automation", mode: str = "chat") -> None:
+async def deliver_assistant_message(
+    text: str, source: str = "automation", mode: str = "chat", mood: Optional[str] = None
+) -> None:
     """Deliver a piece of assistant output that didn't come from an
     interactive /ws turn -- right now, only an automation's finished
     result (see automations.py's run_automation) -- through the exact
@@ -408,12 +493,17 @@ async def deliver_assistant_message(text: str, source: str = "automation", mode:
     sequence counter. A separate event namespace (and, client-side, a
     separate <audio> element and queue) keeps the two completely
     independent instead."""
+    text, tag_mood = extract_mood(text)
+    mood = mood or tag_mood
     text = text.strip()
     if not text:
         return
 
     bus.publish({"type": "message", "role": "assistant", "text": text, "source": source, "mode": mode})
-    await _broadcast({"type": "automation_message", "text": text, "mode": mode})
+    automation_event = {"type": "automation_message", "text": text, "mode": mode}
+    if mood:
+        automation_event["mood"] = mood
+    await _broadcast(automation_event)
 
     sentences, tail = _split_sentences(text)
     if tail.strip():
@@ -433,11 +523,15 @@ async def deliver_assistant_message(text: str, source: str = "automation", mode:
             out["data"] = None
         await _broadcast(out)
 
+    auto_budget = SpeechBudget()
     for sentence in sentences:
-        sentence = sentence.strip()
+        sentence = auto_budget.take(sentence)
         if sentence:
             audio_seq += 1
             tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
+    if auto_budget.overflow_note():
+        audio_seq += 1
+        tts_tasks.append(asyncio.create_task(_speak(auto_budget.overflow_note(), audio_seq)))
 
     if tts_tasks:
         await asyncio.gather(*tts_tasks)
@@ -507,12 +601,32 @@ async def _notification_bridge() -> None:
                     "Push: automation %r -> %d device(s) reached (%d subscribed).",
                     event.get("name"), sent, push.subscription_count(),
                 )
+            elif event_type == "background_job" and event.get("status") in ("completed", "error"):
+                ok = event["status"] == "completed"
+                sent = await asyncio.to_thread(
+                    push.send_notification,
+                    ("Done: " if ok else "Problem: ") + str(event.get("name") or "background job"),
+                    str(event.get("result") or ("Finished." if ok else "It failed."))[:180],
+                    f"job-{event.get('id')}",
+                )
+                logger.info("Push: background job %r -> %d device(s) reached.", event.get("name"), sent)
+            elif event_type == "watchdog_kill":
+                sent = await asyncio.to_thread(
+                    push.send_notification,
+                    "Neural cleaned up a stuck process",
+                    f"A {event.get('kind')} process was still running after "
+                    f"{event.get('age_seconds', 0) // 60} min past its limit (following a "
+                    f"{event.get('mode', 'chat')} turn that timed out) -- it's been stopped, "
+                    "it won't keep running in the background.",
+                    "watchdog-kill",
+                )
+                logger.info("Push: stuck-process cleanup alert -> %d device(s) reached.", sent)
             elif event_type == "tts_error":
+                # tts.py reports each kind of problem at most once per 30 min,
+                # and only marks it fatal when no voice engine worked at all.
+                # A fallback voice taking over is not worth a phone alert.
                 message = event.get("message", "")
-                # Skip the routine "not configured" notice -- that fires on
-                # every voice turn until ElevenLabs is set up, which is an
-                # expected state, not an alert-worthy failure.
-                if message and not message.startswith("ElevenLabs not configured"):
+                if message and event.get("fatal"):
                     sent = await asyncio.to_thread(
                         push.send_notification, "Neural voice error", message[:180], "tts-error"
                     )
@@ -523,8 +637,30 @@ async def _notification_bridge() -> None:
         bus.unsubscribe(queue)
 
 
+# Results of background jobs (background.py) that finished since the chat
+# agent's last turn. They're already shown/spoken to the user; this just
+# lets the next turn KNOW about them, so "what did you find?" works.
+_pending_job_notes: list = []
+
+
+async def _deliver_job_result(job: dict) -> None:
+    title = job["title"]
+    status = job["status"]
+    detail = job.get("result") if status == "completed" else job.get("error")
+    _pending_job_notes.append(f'"{title}" ({status}): {detail or ""}'[:700])
+    del _pending_job_notes[:-6]
+    if status == "completed":
+        spoken, mood = job.get("result") or f'Your background job "{title}" just finished.', job.get("mood")
+    elif status == "cancelled":
+        spoken, mood = f'Stopped the background job "{title}".', "neutral"
+    else:
+        spoken, mood = f'The background job "{title}" ran into a problem: {(detail or "unknown error")[:300]}', "worried"
+    await deliver_assistant_message(spoken, source=f"job:{title}", mood=mood)
+
+
 @app.on_event("startup")
 async def _on_startup() -> None:
+    background.set_result_handler(_deliver_job_result)
     automations.start_scheduler()
     backup.schedule_backup()
     # Only chat mode is pre-warmed at startup -- Tutor mode's shared
@@ -534,6 +670,7 @@ async def _on_startup() -> None:
     # subprocess-boot cost on every single startup regardless.
     asyncio.create_task(_warm_shared_client("chat"))
     asyncio.create_task(_notification_bridge())
+    asyncio.create_task(asyncio.to_thread(tts.warm))  # load the local voice so the first reply isn't slow
     # Visible proof at every boot that push is (or isn't) actually wired up
     # -- print this in your own terminal instead of guessing: 0 subscribed
     # means the ALERTS toggle has never successfully completed on any
@@ -567,6 +704,10 @@ async def _on_startup() -> None:
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
+    try:
+        await background.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
     for client in _shared_clients.values():
         if client is not None:
             try:
@@ -595,10 +736,15 @@ def _event_from_message(msg, text_buffer: list, source: str = "chat"):
     """
     if isinstance(msg, AssistantMessage):
         blocks = []
+        mood = None
         for block in msg.content:
             if isinstance(block, TextBlock):
-                blocks.append({"kind": "text", "text": block.text})
-                text_buffer.append(block.text)
+                # [mood:...] tags drive the avatar's face (see mood.py) and
+                # must never be shown, spoken, or saved to history.
+                clean, block_mood = extract_mood(block.text)
+                mood = block_mood or mood
+                blocks.append({"kind": "text", "text": clean})
+                text_buffer.append(clean)
             elif isinstance(block, ToolUseBlock):
                 blocks.append(
                     {"kind": "tool_use", "tool": block.name, "input": block.input}
@@ -608,23 +754,20 @@ def _event_from_message(msg, text_buffer: list, source: str = "chat"):
                         "type": "tool_use",
                         "tool": block.name,
                         "input": block.input,
+                        "tool_use_id": getattr(block, "id", None),
                         "source": source,
                     }
                 )
-        return {"type": "assistant", "blocks": blocks} if blocks else None
+        if not blocks:
+            return None
+        event = {"type": "assistant", "blocks": blocks}
+        if mood:
+            event["mood"] = mood
+        return event
 
     if isinstance(msg, UserMessage):
-        blocks = []
         for block in getattr(msg, "content", []) or []:
             if isinstance(block, ToolResultBlock):
-                blocks.append(
-                    {
-                        "kind": "tool_result",
-                        "tool_use_id": block.tool_use_id,
-                        "content": block.content,
-                        "is_error": getattr(block, "is_error", False),
-                    }
-                )
                 bus.publish(
                     {
                         "type": "tool_result",
@@ -633,15 +776,96 @@ def _event_from_message(msg, text_buffer: list, source: str = "chat"):
                         "source": source,
                     }
                 )
-        return {"type": "tool_results", "blocks": blocks} if blocks else None
+        # The browser does not render raw tool results. Some media tools
+        # return very large payloads, and forwarding them over the chat
+        # socket can delay the actual assistant completion behind a queue
+        # of invisible data. Activity/audit events above retain the useful
+        # success/failure signal without the payload.
+        return None
 
     if isinstance(msg, ResultMessage):
+        bus.publish(
+            {
+                "type": "turn_result",
+                "cost_usd": getattr(msg, "total_cost_usd", None),
+                "usage": getattr(msg, "usage", None),
+                "duration_ms": getattr(msg, "duration_ms", None),
+                "is_error": getattr(msg, "is_error", False),
+                "source": source,
+            }
+        )
         return {"type": "result", "cost_usd": getattr(msg, "total_cost_usd", None)}
 
     return None
 
 
 _DISCONNECTED = object()  # sentinel put on in_queue when the socket closes
+
+DESKTOP_CONTEXT_MAX_CHARS = 8000
+
+
+def _clean_desktop_context(value) -> str:
+    """Neural Desktop's per-message context (active window, and clipboard
+    text when the user mentions it). Keeps line breaks (clipboard code
+    stays readable), drops other control characters, and caps the size."""
+    if not value:
+        return ""
+    text = str(value).replace("\r\n", "\n")
+    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    text = text.strip()
+    if len(text) > DESKTOP_CONTEXT_MAX_CHARS:
+        text = text[:DESKTOP_CONTEXT_MAX_CHARS] + " ...(truncated)"
+    return text
+
+
+async def _await_unless_superseded(tasks: list, superseded) -> bool:
+    """Wait for a turn's remaining TTS tasks, but give up (cancelling them)
+    the moment a newer message arrives. Previously the loop always awaited
+    every sentence's synthesis before it could even look at the next
+    message -- so interrupting Neural mid-reply still made you wait for the
+    rest of the OLD reply's audio to be generated. Returns False if it gave
+    up."""
+    pending = {t for t in tasks if not t.done()}
+    while pending:
+        if superseded():
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            return False
+        _done, pending = await asyncio.wait(pending, timeout=0.12)
+    return not superseded()
+
+
+_ACK_REPLIES = {
+    "punct": ["I'm here -- what do you need?", "Yep, listening. What's up?"],
+    "greet": ["Hey! What's up?", "Hi! What are we doing?", "Hey there -- what can I do for you?"],
+    "thanks": ["Anytime!", "You got it.", "Happy to help!"],
+    "ok": ["Cool. What's next?", "Alright -- anything else?", "Got it."],
+}
+
+
+def _direct_acknowledgement(text: str) -> str | None:
+    """Handle input that cannot safely mean "continue the last agent plan".
+
+    A bare punctuation reply (``.``, ``??``) has no task semantics. Sending it
+    to a long-lived agent session used to invite the model to continue whatever
+    media plan it had last seen. Respond locally instead: this is instant, costs
+    no model turn, and creates a hard boundary between an acknowledgement and
+    an unfinished render.
+    """
+    import random
+
+    stripped = text.strip()
+    if re.fullmatch(r"[.?!,;:…]+", stripped):
+        return random.choice(_ACK_REPLIES["punct"])
+    lowered = stripped.lower().rstrip("!.")
+    if lowered in {"hey", "hi", "hello", "yo", "hey neural", "hi neural"}:
+        return random.choice(_ACK_REPLIES["greet"])
+    if lowered in {"thanks", "thank you", "thx", "ty", "thanks neural"}:
+        return random.choice(_ACK_REPLIES["thanks"])
+    if lowered in {"ok", "okay", "k", "cool", "got it", "alright"}:
+        return random.choice(_ACK_REPLIES["ok"])
+    return None
 
 
 @app.websocket("/ws")
@@ -710,6 +934,10 @@ async def ws_endpoint(websocket: WebSocket):
     # Running the reader concurrently means interrupt() fires the moment
     # it arrives, regardless of what the main loop is doing.
     in_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+    # Updated by the reader as soon as a message arrives, even while the
+    # previous turn is still inside a video tool. This lets the response
+    # loop suppress stale output before it can be written to the socket.
+    received_generation = 0
 
     async def _handle_set_mode(new_mode: str) -> None:
         """A tab/device switched between Chat and Tutor mode. Updates the
@@ -741,6 +969,7 @@ async def ws_endpoint(websocket: WebSocket):
         await _send({"type": "history", "mode": new_mode, "messages": _chat_history(new_mode), "reset": True})
 
     async def _reader() -> None:
+        nonlocal received_generation
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -771,7 +1000,9 @@ async def ws_endpoint(websocket: WebSocket):
                 # eventually gets dequeued -- a message queued in chat mode
                 # must still be processed as a chat turn even if the user
                 # switches to Tutor mode before the main loop gets to it.
+                received_generation += 1
                 payload["_mode"] = conn_mode
+                payload["_generation"] = received_generation
                 await in_queue.put(payload)
         except WebSocketDisconnect:
             pass
@@ -811,9 +1042,30 @@ async def ws_endpoint(websocket: WebSocket):
             if payload is _DISCONNECTED:
                 break
 
-            text = payload.get("text", "")
-            if not text:
+            text = (payload.get("text") or "").strip()
+            # Neural Desktop (desktop/) tells Neural which window the user is
+            # looking at, so "what does this error mean?" has a referent. It
+            # rides along with the prompt only -- never shown, never saved
+            # to history. "speak": false (desktop's mute toggle, or a quiet
+            # quick action) skips TTS for this turn entirely.
+            desktop_context = _clean_desktop_context(payload.get("context"))
+            speak_enabled = payload.get("speak", True) is not False
+            # Images shown to Neural from the chat UI (see attachments.py
+            # and app.js's "Vision" section): saved under media/uploads/
+            # and handed to Claude as file paths to open with its Read
+            # tool. An image with no text is a perfectly good message.
+            saved_images: list = []
+            if payload.get("attachments"):
+                try:
+                    saved_images = await asyncio.to_thread(attachments.save_attachments, payload["attachments"])
+                except Exception as e:  # noqa: BLE001 -- a bad upload must never kill the connection
+                    logger.error("Couldn't save attachments: %s", e)
+            if not text and not saved_images:
                 continue
+            display_text = text
+            if saved_images:
+                marker = attachments.display_marker(saved_images)
+                display_text = (text + " " + marker) if text else marker
             # The mode THIS message was actually sent in (tagged by
             # _reader at enqueue time), not whatever conn_mode happens to
             # be NOW -- a message queued in chat mode must still run as a
@@ -827,8 +1079,51 @@ async def ws_endpoint(websocket: WebSocket):
             # leftover events a just-interrupted older turn is still
             # finishing up server-side -- see app.js's sendMessage.
             turn_id = payload.get("turn_id")
+            turn_generation = payload.get("_generation", 0)
 
-            bus.publish({"type": "message", "role": "user", "text": text, "source": "chat", "mode": mode})
+            def _superseded() -> bool:
+                return turn_generation < received_generation
+
+            bus.publish({"type": "message", "role": "user", "text": display_text, "source": "chat", "mode": mode})
+
+            direct_reply = _direct_acknowledgement(text)
+            if direct_reply:
+                # Do not route acknowledgements into the model at all. In
+                # particular, they must never become a reason to poll or
+                # resume an earlier render.
+                await _send(
+                    {
+                        "type": "assistant",
+                        "blocks": [{"kind": "text", "text": direct_reply}],
+                        "mood": "happy",
+                        "turn_id": turn_id,
+                    }
+                )
+                bus.publish(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "text": direct_reply,
+                        "source": "chat",
+                        "mode": mode,
+                    }
+                )
+                await _send({"type": "result", "turn_id": turn_id})
+                # Spoken too (these used to be silent text) -- still no model
+                # turn, just one short TTS clip.
+                spoken = 0
+                try:
+                    clip = await tts.synthesize(direct_reply) if speak_enabled else None
+                except Exception:  # noqa: BLE001
+                    clip = None
+                if clip and not _superseded():
+                    spoken = 1
+                    await _send({
+                        "type": "audio", "seq": 1, "turn_id": turn_id, "mime": clip[1],
+                        "data": base64.b64encode(clip[0]).decode("ascii"),
+                    })
+                await _send({"type": "audio_done", "count": spoken, "turn_id": turn_id})
+                continue
 
             # Voice-triggered automations: a saved automation can carry a
             # trigger phrase (set in the automation form), and saying (or
@@ -848,7 +1143,7 @@ async def ws_endpoint(websocket: WebSocket):
             # arrives shortly afterward through automations.run_automation
             # -> deliver_assistant_message, the exact same pipeline a
             # scheduled or "run now" firing already uses.
-            matched = automations.match_voice_trigger(text)
+            matched = automations.match_voice_trigger(text) if not saved_images else None
             if matched:
                 asyncio.create_task(automations.run_automation(matched["id"]))
                 await deliver_assistant_message(
@@ -862,9 +1157,13 @@ async def ws_endpoint(websocket: WebSocket):
             speech_pending = ""
             audio_seq = 0
             tts_tasks: list = []
+            # Only the opening of a reply is spoken (see speech_budget.py);
+            # the full text is always on screen.
+            spoken_budget = SpeechBudget()
 
             async def _speak(chunk: str, seq: int) -> None:
-                result = await tts.synthesize(chunk)
+                chunk = extract_mood(chunk)[0].strip() if speak_enabled else ""
+                result = await tts.synthesize(chunk) if chunk else None
                 out: dict = {"type": "audio", "seq": seq, "turn_id": turn_id}
                 if result:
                     audio, mime = result
@@ -878,9 +1177,71 @@ async def ws_endpoint(websocket: WebSocket):
                 await _send(out)
 
             try:
-                async for msg in _run_turn(wrap_for_voice(text, mode=mode), mode=mode):
-                    event = _event_from_message(msg, text_buffer)
+                prompt = text
+                if saved_images:
+                    prompt = attachments.prompt_note(saved_images) + (text or "What do you make of this?")
+                if desktop_context:
+                    prompt = (
+                        "[Desktop context, gathered automatically by Neural Desktop -- not typed by the user]\n"
+                        + desktop_context + "\n[/Desktop context]\n\n" + prompt
+                    )
+                if mode == "chat" and _pending_job_notes:
+                    notes = "\n".join(f"- {n}" for n in _pending_job_notes)
+                    _pending_job_notes.clear()
+                    prompt = (
+                        "[Background job results that arrived since your last reply -- already shown and "
+                        "spoken to the user, so don't repeat them unless asked:\n" + notes + "]\n\n" + prompt
+                    )
+                # Speak while generating: text deltas from the partial-message
+                # stream go to the chat bubble and to TTS immediately, so the
+                # first sentence starts playing while the rest is still being
+                # written (see speech_stream.py). The complete AssistantMessage
+                # that follows only contributes what wasn't streamed (tool
+                # calls, or everything if streaming isn't available).
+                streamer = TextStreamer()
+                async for msg in _run_turn(wrap_for_voice(prompt, mode=mode), mode=mode):
+                    if isinstance(msg, StreamEvent):
+                        if msg.parent_tool_use_id:
+                            continue
+                        piece, stream_mood = streamer.feed(msg.event or {})
+                        if (not piece and not stream_mood) or _superseded():
+                            continue
+                        out = {"type": "assistant", "blocks": [], "turn_id": turn_id}
+                        if stream_mood:
+                            out["mood"] = stream_mood
+                        if piece:
+                            out["blocks"].append({"kind": "text", "text": piece})
+                            text_buffer.append(piece)
+                            speech_pending += piece
+                        await _send(out)
+                        if piece:
+                            sentences, speech_pending = _split_sentences(speech_pending)
+                            for sentence in sentences:
+                                sentence = spoken_budget.take(sentence)
+                                if sentence:
+                                    audio_seq += 1
+                                    tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
+                        continue
+
+                    already_streamed = isinstance(msg, AssistantMessage) and streamer.text_already_streamed(
+                        getattr(msg, "message_id", None)
+                    )
+                    message_text: list = []
+                    event = _event_from_message(msg, message_text)
                     if event is None:
+                        continue
+                    if already_streamed and event["type"] == "assistant":
+                        event["blocks"] = [b for b in event["blocks"] if b["kind"] != "text"]
+                        event.pop("mood", None)
+                        if not event["blocks"]:
+                            continue
+                    else:
+                        text_buffer.extend(message_text)
+                    # A newer prompt has already arrived. Continue draining
+                    # the SDK until its interrupt/reset path releases the
+                    # shared client, but never attach the old render's final
+                    # text (or a late ResultMessage) to the new prompt.
+                    if _superseded():
                         continue
                     event["turn_id"] = turn_id
                     await _send(event)
@@ -890,7 +1251,7 @@ async def ws_endpoint(websocket: WebSocket):
                                 speech_pending += block["text"]
                         sentences, speech_pending = _split_sentences(speech_pending)
                         for sentence in sentences:
-                            sentence = sentence.strip()
+                            sentence = spoken_budget.take(sentence)
                             if sentence:
                                 audio_seq += 1
                                 tts_tasks.append(asyncio.create_task(_speak(sentence, audio_seq)))
@@ -904,6 +1265,17 @@ async def ws_endpoint(websocket: WebSocket):
                 # silence, or letting an uncaught exception tear down this
                 # whole connection.
                 logger.error("Turn failed for mode %s: %s", mode, e)
+                if _superseded():
+                    # The interruption is already being handled by the
+                    # next request. Do not place a reset/error reply into
+                    # its chat stream.
+                    for task in tts_tasks:
+                        task.cancel()
+                    if tts_tasks:
+                        await asyncio.gather(*tts_tasks, return_exceptions=True)
+                    text_buffer.clear()
+                    speech_pending = ""
+                    continue
                 error_text = str(e) or "Something went wrong on that turn -- please try again."
                 text_buffer.append(error_text)
                 await _send(
@@ -912,33 +1284,50 @@ async def ws_endpoint(websocket: WebSocket):
                 audio_seq += 1
                 tts_tasks.append(asyncio.create_task(_speak(error_text, audio_seq)))
 
+            # A stale turn's TTS work is invisible to the user and can hold
+            # the queue behind a completed render. Cancel it immediately;
+            # any audio already sent is still harmlessly dropped by the
+            # frontend's turn-id guard.
+            if _superseded():
+                for task in tts_tasks:
+                    task.cancel()
+                if tts_tasks:
+                    await asyncio.gather(*tts_tasks, return_exceptions=True)
+                text_buffer.clear()
+                speech_pending = ""
+
             # Flush whatever's left in the buffer (a reply that doesn't
             # end on ./!/? -- common for short spoken replies) as the
             # final chunk.
-            tail = speech_pending.strip()
-            if tail:
+            tail = spoken_budget.take(speech_pending)
+            if tail and not _superseded():
                 audio_seq += 1
                 tts_tasks.append(asyncio.create_task(_speak(tail, audio_seq)))
+            overflow_note = spoken_budget.overflow_note()
+            if overflow_note and speak_enabled and not _superseded():
+                audio_seq += 1
+                tts_tasks.append(asyncio.create_task(_speak(overflow_note, audio_seq)))
 
-            if text_buffer:
+            if text_buffer and not _superseded():
                 bus.publish(
                     {
                         "type": "message",
                         "role": "assistant",
-                        "text": "".join(text_buffer),
+                        "text": extract_mood("".join(text_buffer))[0].strip(),
                         "source": "chat",
                         "mode": mode,
                     }
                 )
 
-            if tts_tasks:
-                await asyncio.gather(*tts_tasks)
+            if tts_tasks and not _superseded():
+                await _await_unless_superseded(tts_tasks, _superseded)
             # Tells the frontend exactly how many audio chunks to expect
             # for this turn, so it knows when the reply is fully spoken
             # even though chunks arrive (and finish synthesizing) out of
             # order -- see the frontend's audio queue for the other half
             # of this.
-            await _send({"type": "audio_done", "count": audio_seq, "turn_id": turn_id})
+            if not _superseded():
+                await _send({"type": "audio_done", "count": audio_seq, "turn_id": turn_id})
     finally:
         # No client-disconnect here -- each mode's agent client is shared
         # across every device/tab currently in that mode, so one
@@ -1001,7 +1390,54 @@ class AutomationToggle(BaseModel):
 async def api_config():
     """Non-secret settings the frontend needs -- e.g. the wake phrase for
     continuous voice listening. Never put API keys or tokens here."""
-    return {"wake_phrase": config.WAKE_PHRASE}
+    return {"wake_phrase": config.WAKE_PHRASE, "utility": utility.utility_status()}
+
+
+class SpeakIn(BaseModel):
+    text: str
+
+
+@app.post("/api/transcribe")
+async def api_transcribe(request: Request):
+    """Neural Desktop's voice input: a short WAV clip in, text out, using
+    local Whisper (backend/stt.py). Optional ?language=xx overrides
+    STT_LANGUAGE for this clip (empty = auto-detect)."""
+    data = await request.body()
+    mime = request.headers.get("content-type", "audio/wav")
+    language = request.query_params.get("language")
+    try:
+        return await asyncio.to_thread(stt.transcribe_audio, data, mime, language)
+    except stt.STTUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Bad audio: {e}")
+
+
+@app.post("/api/transcribe/warm")
+async def api_transcribe_warm():
+    """Loads the voice model in the background so the first clip is fast."""
+    ready = await asyncio.to_thread(stt.warm)
+    return {"ready": ready, "available": stt.available()}
+
+
+@app.post("/api/speak")
+async def api_speak(body: SpeakIn):
+    """Text in, Neural's voice out (same TTS chain as chat replies). Lets
+    the desktop app speak instant local answers -- the time, "opening
+    Spotify", a reminder -- in the same voice without a model turn."""
+    text = extract_mood(body.text or "")[0].strip()[:1500]
+    if not text:
+        raise HTTPException(status_code=400, detail="Nothing to say.")
+    clip = await tts.synthesize(text)
+    if not clip:
+        raise HTTPException(status_code=503, detail="Text-to-speech is unavailable right now.")
+    return Response(content=clip[0], media_type=clip[1])
+
+
+@app.get("/api/observability")
+async def api_observability():
+    """Local, sanitized runtime health/audit snapshot for the dashboard."""
+    return observability.dashboard_snapshot()
 
 
 @app.api_route("/media/{token}", methods=["GET", "HEAD"])

@@ -10,13 +10,47 @@ const notifToggle = document.getElementById("notif-toggle");
 const panelToggle = document.getElementById("panel-toggle");
 const sideCol = document.getElementById("side-col");
 const sideBackdrop = document.getElementById("side-backdrop");
+const opsToggle = document.getElementById("ops-toggle");
+const opsPanel = document.getElementById("ops-panel");
+const opsBackdrop = document.getElementById("ops-backdrop");
+const opsClose = document.getElementById("ops-close");
 const ttsPlayer = document.getElementById("tts-player");
 const uptimeEl = document.getElementById("uptime");
 
 const orb = document.getElementById("orb");
 const coreState = document.getElementById("core-state");
 
+// Neural's animated avatar (frontend/avatar.js). Optional by design: if
+// that script failed to load or throws for any reason, everything below
+// keeps working exactly as before with just the orb.
+let avatar = null;
+// Background jobs currently running (id -> title), from the live event
+// feed, and the last UI state -- so the avatar can say "Background: ..."
+// whenever she's otherwise idle. Declared up here because setState()
+// below runs once at load.
+const backgroundJobs = new Map();
+let uiState = "offline";
+try {
+  const avatarMount = document.getElementById("avatar-mount");
+  if (avatarMount && window.NeuralAvatar) avatar = new window.NeuralAvatar(avatarMount);
+  if (avatar) {
+    document.getElementById("avatar-stage").classList.add("has-avatar");
+    window.neuralAvatar = avatar; // handy from the browser console
+  }
+} catch (e) {
+  console.error("Avatar failed to start:", e);
+  avatar = null;
+}
+
 const activityFeed = document.getElementById("activity-feed");
+const observabilityUpdated = document.getElementById("observability-updated");
+const opsSummary = document.getElementById("ops-summary");
+const opsHealth = document.getElementById("ops-health");
+const opsUtility = document.getElementById("ops-utility");
+const opsActiveWrap = document.getElementById("ops-active-wrap");
+const opsActive = document.getElementById("ops-active");
+const opsFailuresWrap = document.getElementById("ops-failures-wrap");
+const opsFailures = document.getElementById("ops-failures");
 
 const automationsList = document.getElementById("automations-list");
 const modalBackdrop = document.getElementById("automation-modal-backdrop");
@@ -73,6 +107,19 @@ function setState(state, label) {
     orb.classList.add(state);
   }
   coreState.textContent = label;
+  uiState = state;
+  if (avatar) {
+    avatar.setState(state || "idle");
+    if (state !== "thinking") avatar.setActivity(null);
+    refreshIdleChip();
+  }
+}
+
+function refreshIdleChip() {
+  if (!avatar || uiState !== "idle" || !backgroundJobs.size) return;
+  const first = backgroundJobs.values().next().value;
+  const more = backgroundJobs.size > 1 ? " (+" + (backgroundJobs.size - 1) + ")" : "";
+  avatar.setActivity("Background: " + first + more, "gear");
 }
 
 setState("offline", "STANDBY");
@@ -88,12 +135,157 @@ function tickClock() {
 setInterval(tickClock, 1000);
 tickClock();
 
+/* ---------------- Operations dashboard ---------------- */
+
+function shortTime(ts) {
+  if (!ts) return "";
+  try { return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  catch (e) { return ""; }
+}
+
+function renderOpsList(el, rows, emptyText, render) {
+  if (!rows || !rows.length) {
+    el.innerHTML = '<div class="empty-note">' + escapeHtml(emptyText) + "</div>";
+    return;
+  }
+  el.innerHTML = rows.map(render).join("");
+}
+
+function renderObservability(data) {
+  const usage = data.usage || {};
+  const tokens = usage.tokens || {};
+  const cost = Number(usage.recorded_cost_usd || 0).toFixed(4);
+  opsSummary.innerHTML =
+    '<span><b>' + escapeHtml(usage.audited_actions || 0) + '</b> actions</span>' +
+    '<span><b>' + escapeHtml(usage.tool_calls || 0) + '</b> tools</span>' +
+    '<span><b>' + escapeHtml(Math.round((tokens.input || 0) / 1000)) + 'k</b> input</span>' +
+    '<span><b>' + escapeHtml(Math.round((tokens.output || 0) / 1000)) + 'k</b> output</span>' +
+    '<span><b>$' + escapeHtml(cost) + '</b> recorded</span>';
+
+  const health = data.health || {};
+  opsHealth.innerHTML = Object.entries(health).map(([name, item]) => {
+    const status = item.status || "unknown";
+    const cls = status === "configured" || status === "ready" || status === "enabled" ? "ok" : "muted";
+    return '<span class="ops-health ' + cls + '" title="' + escapeHtml(status) + '">' +
+      escapeHtml(name) + "</span>";
+  }).join("");
+
+  const utility = data.utility || {};
+  const routedTo = utility.selected || "claude";
+  const byProvider = utility.by_provider || {};
+  const qwenCalls = byProvider.qwen || 0;
+  const claudeCalls = byProvider.claude || 0;
+  opsUtility.innerHTML =
+    '<div class="ops-row"><span>ACTIVE</span><span>' + escapeHtml(routedTo) + '</span><span>' +
+    escapeHtml(utility.calls || 0) + ' calls</span></div>' +
+    '<div class="ops-row"><span>QWEN</span><span>stateless only</span><span>' + escapeHtml(qwenCalls) + '</span></div>' +
+    '<div class="ops-row"><span>CLAUDE</span><span>fallback</span><span>' + escapeHtml(claudeCalls) + '</span></div>';
+
+  const active = data.active_jobs || [];
+  opsActiveWrap.hidden = !active.length;
+  renderOpsList(opsActive, active, "No active jobs.", (name) =>
+    '<div class="ops-row active"><span>RUNNING</span><span>' + escapeHtml(name) + "</span></div>");
+
+  const failures = data.failures || [];
+  opsFailuresWrap.hidden = !failures.length;
+  renderOpsList(opsFailures, failures, "No failures recorded.", (item) =>
+    '<div class="ops-row failure"><span>' + escapeHtml(item.tool || item.type || "error") + '</span><span>' +
+      escapeHtml(item.summary || "Failed") + "</span></div>");
+
+  observabilityUpdated.textContent = "LIVE " + shortTime(data.generated_at);
+}
+
+async function loadObservability() {
+  try {
+    const response = await fetch("/api/observability");
+    if (!response.ok) throw new Error("dashboard request failed");
+    renderObservability(await response.json());
+  } catch (e) {
+    observabilityUpdated.textContent = "OFFLINE";
+  }
+}
+
+loadObservability();
+setInterval(loadObservability, 15000);
+
 /* ---------------- Chat ---------------- */
 
-function addMessage(role, text) {
+// Small, escape-first markdown renderer for assistant replies (Tutor mode
+// sends code blocks; chat replies occasionally carry **bold** or a link).
+// Everything is HTML-escaped BEFORE any markup is added, and links only
+// ever become <a> tags for plain http(s) URLs with no quotes/brackets in
+// them, so model output can never inject markup of its own.
+function renderMarkdown(src) {
+  const blocks = [];
+  const inline = [];
+  let out = escapeHtml(src);
+  out = out.replace(/```[\w+-]*\n?([\s\S]*?)(?:```|$)/g, (m, code) => {
+    blocks.push("<pre><code>" + code.replace(/\n$/, "") + "</code></pre>");
+    return "\u0000" + (blocks.length - 1) + "\u0000";
+  });
+  out = out.replace(/`([^`\n]+)`/g, (m, c) => {
+    inline.push("<code>" + c + "</code>");
+    return "\u0001" + (inline.length - 1) + "\u0001";
+  });
+  out = out
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)"'<>]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s)"'<>]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  let html = "";
+  let list = null;
+  let para = [];
+  const flushPara = () => { if (para.length) { html += "<p>" + para.join("<br>") + "</p>"; para = []; } };
+  const flushList = () => { if (list) { html += "</" + list + ">"; list = null; } };
+  for (const line of out.split("\n")) {
+    const ul = line.match(/^\s*[-*\u2022]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) {
+      flushPara();
+      const tag = ul ? "ul" : "ol";
+      if (list !== tag) { flushList(); html += "<" + tag + ">"; list = tag; }
+      html += "<li>" + (ul ? ul[1] : ol[1]) + "</li>";
+      continue;
+    }
+    flushList();
+    if (!line.trim()) { flushPara(); continue; }
+    if (/^\u0000\d+\u0000$/.test(line.trim())) { flushPara(); html += line.trim(); continue; }
+    const heading = line.match(/^#{1,4}\s+(.*)$/);
+    if (heading) { flushPara(); html += "<p><strong>" + heading[1] + "</strong></p>"; continue; }
+    para.push(line);
+  }
+  flushPara();
+  flushList();
+  return html
+    .replace(/\u0000(\d+)\u0000/g, (m, i) => blocks[+i])
+    .replace(/\u0001(\d+)\u0001/g, (m, i) => inline[+i]);
+}
+
+function setMessageText(div, text) {
+  div._raw = text;
+  const body = div.querySelector(".msg-body") || div;
+  if (div.classList.contains("assistant")) body.innerHTML = renderMarkdown(text);
+  else body.textContent = text;
+}
+
+function addMessage(role, text, images) {
   const div = document.createElement("div");
   div.className = "msg " + role;
-  div.textContent = text;
+  if (images && images.length) {
+    const strip = document.createElement("div");
+    strip.className = "msg-images";
+    for (const src of images) {
+      const img = document.createElement("img");
+      img.src = src;
+      img.alt = "Image shown to Neural";
+      strip.appendChild(img);
+    }
+    div.appendChild(strip);
+  }
+  const body = document.createElement("div");
+  body.className = "msg-body";
+  div.appendChild(body);
+  setMessageText(div, text || "");
   chatLog.appendChild(div);
   chatLog.scrollTop = chatLog.scrollHeight;
   return div;
@@ -122,6 +314,20 @@ function ensureAudioBoost() {
       gainNode.gain.value = TTS_VOLUME_BOOST;
       source.connect(gainNode);
       gainNode.connect(audioCtx.destination);
+      // Lip-sync tap for the avatar: measures the raw clip (before the
+      // boost above) so her mouth follows the actual speech. Routed into
+      // a muted gain node so every browser keeps pulling audio through it.
+      try {
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.2;
+        const mute = audioCtx.createGain();
+        mute.gain.value = 0;
+        source.connect(analyser);
+        analyser.connect(mute);
+        mute.connect(audioCtx.destination);
+        if (avatar) avatar.setAnalyser(analyser);
+      } catch (e) {}
     }
   } catch (e) {
     // Best-effort -- if this fails for any reason the <audio> element
@@ -146,6 +352,11 @@ let expectingAudio = false;   // this turn will produce at least a "no chunks" a
 // out of order/twice).
 let turnCounter = 0;
 let activeTurnId = null;
+// What Neural is saying/said in the current reply, and when she last
+// stopped talking -- used to tell YOUR voice apart from her own voice
+// leaking from the speakers into the mic (see looksLikeOwnEcho below).
+let replyTextForEcho = "";
+let lastSpeechEndedAt = 0;
 let currentTurn = {
   queue: [],          // {seq, mime, data} not yet played, out of order is fine
   nextSeqToPlay: 1,
@@ -182,6 +393,7 @@ function maybeFinishSpeaking() {
   if (currentTurn.totalChunks !== null && currentTurn.playedChunks >= currentTurn.totalChunks) {
     isSpeaking = false;
     expectingAudio = false;
+    lastSpeechEndedAt = Date.now();
     setState("idle", "ONLINE");
     resumeWakeListeningIfOn();
     return true;
@@ -245,6 +457,10 @@ function onAudioDone(count) {
 // so it can never corrupt an in-progress reply's bubble or interleave
 // its audio chunks with the reply's own.
 const automationAudioEl = new Audio();
+automationAudioEl.addEventListener("playing", () => { if (avatar) avatar.setTalking(true); });
+for (const ev of ["pause", "ended", "error"]) {
+  automationAudioEl.addEventListener(ev, () => { if (avatar) avatar.setTalking(false); });
+}
 let automationQueue = [];     // {seq, mime, data} not yet played
 let automationNextSeq = 1;
 
@@ -349,6 +565,7 @@ function updateModeUI() {
     tab.setAttribute("aria-selected", active ? "true" : "false");
   }
   document.body.classList.toggle("mode-tutor", currentMode === "tutor");
+  if (avatar) avatar.setMode(currentMode);
   chatInput.placeholder = currentMode === "tutor" ? "Ask your tutor…" : "Talk to Neural…";
   if (blockAutomations) blockAutomations.hidden = currentMode === "tutor";
   if (blockKnowledgeBase) blockKnowledgeBase.hidden = currentMode !== "tutor";
@@ -379,6 +596,7 @@ function playModeSwitchAnimation() {
   void orb.offsetWidth;
   orb.classList.add("mode-switching");
   setTimeout(() => orb.classList.remove("mode-switching"), 900);
+  if (avatar) avatar.flourish();
 }
 
 if (modeTabs) {
@@ -451,6 +669,7 @@ function connect() {
     // doesn't belong to that conversation -- this is just the live,
     // in-the-moment notice.
     if (data.type === "automation_message") {
+      if (data.mood && avatar) avatar.setMood(data.mood);
       addMessage("assistant", data.text);
       return;
     }
@@ -469,10 +688,12 @@ function connect() {
     if (data.turn_id !== undefined && data.turn_id !== activeTurnId) return;
 
     if (data.type === "assistant") {
+      if (data.mood && avatar) avatar.setMood(data.mood);
       for (const block of data.blocks) {
-        if (block.kind === "text") {
+        if (block.kind === "text" && block.text) {
           if (!assistantDiv) assistantDiv = addMessage("assistant", "");
-          assistantDiv.textContent += block.text;
+          setMessageText(assistantDiv, (assistantDiv._raw || "") + block.text);
+          replyTextForEcho += block.text;
           chatLog.scrollTop = chatLog.scrollHeight;
         }
       }
@@ -521,29 +742,345 @@ function bargeIn() {
   return true;
 }
 
-function sendMessage(text) {
-  if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+function sendMessage(text, attachments) {
+  attachments = attachments || [];
+  if ((!text && !attachments.length) || !socket || socket.readyState !== WebSocket.OPEN) return false;
 
   bargeIn();
   turnCounter += 1;
   activeTurnId = turnCounter;
 
-  addMessage("user", text);
+  addMessage("user", text, attachments.map((a) => a.dataUrl));
   assistantDiv = null;
+  replyTextForEcho = "";
   isSpeaking = false;
   expectingAudio = true; // every reply now always talks -- see main.py
   resetTurnAudio();
   setState("thinking", "PROCESSING");
-  socket.send(JSON.stringify({ type: "message", text, turn_id: activeTurnId }));
+  const payload = { type: "message", text, turn_id: activeTurnId };
+  if (attachments.length) {
+    payload.attachments = attachments.map((a) => ({
+      mime: a.mime,
+      kind: a.kind,
+      data: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
+    }));
+  }
+  socket.send(JSON.stringify(payload));
+  return true;
 }
 
 chatForm.addEventListener("submit", (e) => {
   e.preventDefault();
   const text = chatInput.value.trim();
-  if (!text) return;
-  sendMessage(text);
-  chatInput.value = "";
+  const atts = pendingAttachments.slice();
+  if (!text && !atts.length) return;
+  if (sendMessage(text, atts)) {
+    chatInput.value = "";
+    clearPendingAttachments();
+  }
 });
+
+/* ---------------- Vision: show Neural an image ---------------- */
+// Three ways in: pick/paste/drop an image, "Look at my screen" (a single
+// frame from the browser's screen-share picker -- nothing keeps
+// recording), or "Take a photo" (camera). Each image is downscaled here
+// to at most MAX_IMAGE_EDGE px and re-encoded as JPEG before it's sent,
+// so a 4K screenshot is a few hundred KB over the websocket, not 10MB.
+// The backend saves it under media/uploads/ and asks Claude to look at it
+// with its own Read tool -- which is how Claude Code already views images
+// -- so this uses nothing beyond the existing Claude subscription.
+const attachBtn = document.getElementById("attach-btn");
+const attachMenu = document.getElementById("attach-menu");
+const attachStrip = document.getElementById("attach-strip");
+const attachFileInput = document.getElementById("attach-file");
+const attachCameraInput = document.getElementById("attach-camera-input");
+const attachScreenItem = document.getElementById("attach-screen-item");
+const chatCol = document.getElementById("chat-col");
+const cameraBackdrop = document.getElementById("camera-backdrop");
+const cameraVideo = document.getElementById("camera-video");
+const MAX_ATTACHMENTS = 4;
+const MAX_IMAGE_EDGE = 1600;
+let pendingAttachments = []; // {dataUrl, mime, kind}
+let cameraStream = null;
+let cameraFacing = "user";
+
+const touchOnlyDevice = window.matchMedia
+  && window.matchMedia("(pointer: coarse)").matches
+  && !window.matchMedia("(any-pointer: fine)").matches;
+if (attachScreenItem && (touchOnlyDevice || !(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia))) {
+  // Phones/tablets don't offer screen capture to web pages at all.
+  attachScreenItem.hidden = true;
+}
+
+function renderAttachStrip() {
+  if (!attachStrip) return;
+  attachStrip.innerHTML = "";
+  attachStrip.hidden = pendingAttachments.length === 0;
+  if (attachBtn) attachBtn.classList.toggle("has-items", pendingAttachments.length > 0);
+  pendingAttachments.forEach((a, i) => {
+    const thumb = document.createElement("div");
+    thumb.className = "attach-thumb";
+    const img = document.createElement("img");
+    img.src = a.dataUrl;
+    img.alt = "Attached image";
+    const kind = document.createElement("span");
+    kind.className = "attach-kind";
+    kind.textContent = a.kind === "screen" ? "screen" : a.kind === "camera" ? "photo" : "";
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.textContent = "✕";
+    rm.title = "Remove";
+    rm.addEventListener("click", () => {
+      pendingAttachments.splice(i, 1);
+      renderAttachStrip();
+    });
+    thumb.append(img, kind, rm);
+    attachStrip.appendChild(thumb);
+  });
+}
+
+function clearPendingAttachments() {
+  pendingAttachments = [];
+  renderAttachStrip();
+}
+
+function addAttachment(dataUrl, kind) {
+  if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+    addMessage("system", "That's the most images I can take in one message (" + MAX_ATTACHMENTS + ").");
+    return;
+  }
+  pendingAttachments.push({ dataUrl, mime: "image/jpeg", kind });
+  renderAttachStrip();
+  if (avatar) avatar.reactTo("curious", 1.4);
+  chatInput.focus();
+}
+
+// Draws any image source onto a canvas no larger than MAX_IMAGE_EDGE on
+// its longest side and returns it as a JPEG data URL.
+function canvasJpeg(source, w, h) {
+  const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(w, h));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(w * scale));
+  canvas.height = Math.max(1, Math.round(h * scale));
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.86);
+}
+
+function imageFileToJpeg(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        resolve(canvasJpeg(img, img.naturalWidth, img.naturalHeight));
+      } catch (e) {
+        reject(e);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("couldn't read that image"));
+    };
+    img.src = url;
+  });
+}
+
+async function addImageFiles(files, kind) {
+  for (const file of files) {
+    if (!file || !file.type || !file.type.startsWith("image/")) continue;
+    try {
+      addAttachment(await imageFileToJpeg(file), kind || "file");
+    } catch (e) {
+      addMessage("system", "Couldn't attach " + (file.name || "that image") + ": " + e.message);
+    }
+  }
+}
+
+async function captureScreen() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  } catch (e) {
+    if (e && e.name !== "NotAllowedError" && e.name !== "AbortError") {
+      addMessage("system", "Screen capture isn't available here: " + e.message);
+    }
+    return;
+  }
+  try {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.srcObject = stream;
+    await video.play();
+    // Give the first real frame a moment to arrive (some browsers hand
+    // back a black frame if you draw immediately).
+    await new Promise((r) => setTimeout(r, 400));
+    addAttachment(canvasJpeg(video, video.videoWidth, video.videoHeight), "screen");
+  } catch (e) {
+    addMessage("system", "Couldn't grab the screen: " + e.message);
+  } finally {
+    stream.getTracks().forEach((t) => t.stop());
+  }
+}
+
+async function openCamera() {
+  // Phones get the native camera UI via the capture input; desktops get a
+  // live preview with a Capture button.
+  const coarse = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+  if (coarse || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    attachCameraInput.click();
+    return;
+  }
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacing }, audio: false });
+  } catch (e) {
+    addMessage("system", "Camera unavailable: " + e.message);
+    return;
+  }
+  cameraVideo.srcObject = cameraStream;
+  cameraBackdrop.hidden = false;
+}
+
+function closeCamera() {
+  if (cameraStream) cameraStream.getTracks().forEach((t) => t.stop());
+  cameraStream = null;
+  cameraVideo.srcObject = null;
+  cameraBackdrop.hidden = true;
+}
+
+function setAttachMenu(open) {
+  if (!attachMenu) return;
+  attachMenu.hidden = !open;
+  attachBtn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+if (attachBtn && attachMenu) {
+  attachBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setAttachMenu(attachMenu.hidden);
+  });
+  attachMenu.addEventListener("click", (e) => {
+    const item = e.target.closest("[data-attach]");
+    if (!item) return;
+    setAttachMenu(false);
+    const what = item.dataset.attach;
+    if (what === "file") attachFileInput.click();
+    else if (what === "screen") captureScreen();
+    else if (what === "camera") openCamera();
+  });
+  document.addEventListener("click", (e) => {
+    if (!attachMenu.hidden && !e.target.closest(".attach-wrap")) setAttachMenu(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setAttachMenu(false);
+  });
+}
+
+if (attachFileInput) {
+  attachFileInput.addEventListener("change", () => {
+    addImageFiles([...attachFileInput.files], "file");
+    attachFileInput.value = "";
+  });
+}
+if (attachCameraInput) {
+  attachCameraInput.addEventListener("change", () => {
+    addImageFiles([...attachCameraInput.files], "camera");
+    attachCameraInput.value = "";
+  });
+}
+
+if (cameraBackdrop) {
+  document.getElementById("camera-close").addEventListener("click", closeCamera);
+  document.getElementById("camera-cancel").addEventListener("click", closeCamera);
+  document.getElementById("camera-capture").addEventListener("click", () => {
+    if (cameraVideo.videoWidth) addAttachment(canvasJpeg(cameraVideo, cameraVideo.videoWidth, cameraVideo.videoHeight), "camera");
+    closeCamera();
+  });
+  document.getElementById("camera-flip").addEventListener("click", async () => {
+    cameraFacing = cameraFacing === "user" ? "environment" : "user";
+    closeCamera();
+    await openCamera();
+  });
+}
+
+// Paste an image anywhere (screenshot tool -> Ctrl+V).
+document.addEventListener("paste", (e) => {
+  const files = [...((e.clipboardData && e.clipboardData.files) || [])].filter((f) => f.type.startsWith("image/"));
+  if (!files.length) return;
+  e.preventDefault();
+  addImageFiles(files, "file");
+});
+
+// Drag & drop onto the chat column.
+if (chatCol) {
+  let dragDepth = 0;
+  const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+  chatCol.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    chatCol.classList.add("dragging");
+  });
+  chatCol.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+  chatCol.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) chatCol.classList.remove("dragging");
+  });
+  chatCol.addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    chatCol.classList.remove("dragging");
+    addImageFiles([...e.dataTransfer.files], "file");
+  });
+}
+
+/* ---------------- Avatar: what she's doing right now ---------------- */
+// Turns the live tool-activity feed into the little status chip above the
+// avatar ("Browsing the web", "Looking at your image", ...).
+let avatarActivityTimer = null;
+
+function avatarActivityFor(event) {
+  const tool = event.tool || "";
+  const input = event.input || {};
+  if (tool === "Bash") return ["Running a command", "code"];
+  if (tool.includes("media_analysis")) return ["Watching the video", "video"];
+  if (tool === "Read") {
+    const readPath = String(input.file_path || "");
+    if (/media[\\/]+analysis[\\/]/i.test(readPath)) return ["Watching the video", "eye"];
+    return /media[\\/]+uploads[\\/]/i.test(readPath)
+      ? ["Looking at your image", "eye"]
+      : ["Reading a file", "file"];
+  }
+  if (tool === "Write" || tool === "Edit" || tool === "MultiEdit" || tool === "NotebookEdit") return ["Editing a file", "file"];
+  if (tool === "Glob" || tool === "Grep") return ["Searching files", "search"];
+  if (tool === "WebSearch") return ["Searching the web", "search"];
+  if (tool === "WebFetch" || tool.includes("browser")) return ["Browsing the web", "web"];
+  if (tool.includes("gmail")) return ["Checking email", "mail"];
+  if (tool.includes("calendar")) return ["Checking your calendar", "mail"];
+  if (tool.includes("memory") || tool.includes("crm")) return ["Remembering", "memory"];
+  if (tool.includes("video") || tool.includes("__cap__")) return ["Working on video", "video"];
+  if (tool.includes("stock")) return ["Finding footage", "video"];
+  if (tool.includes("jobs")) return ["Searching jobs", "search"];
+  if (tool.includes("buffer")) return ["Preparing a post", "web"];
+  if (tool.includes("tutor_kb") || tool.includes("tutor_docs")) return ["Checking references", "file"];
+  if (tool.includes("automation")) return ["Checking automations", "gear"];
+  return ["Working on it", "gear"];
+}
+
+function updateAvatarActivity(event) {
+  if (!avatar || event.type !== "tool_use") return;
+  if (event.source && event.source !== "chat") return;
+  const [label, kind] = avatarActivityFor(event);
+  avatar.setActivity(label, kind);
+  clearTimeout(avatarActivityTimer);
+  avatarActivityTimer = setTimeout(() => { avatar.setActivity(null); refreshIdleChip(); }, 12000);
+}
 
 /* ---------------- Voice: mic + wake word ---------------- */
 
@@ -577,7 +1114,9 @@ if (!SR) {
 }
 
 function sendVoiceCommand(text) {
-  sendMessage(text);
+  // A spoken question goes out with whatever image is waiting in the
+  // composer -- attach a screenshot, then just ask "what's this?".
+  if (sendMessage(text, pendingAttachments.slice())) clearPendingAttachments();
 }
 
 // Wake word mode, once turned on with the toggle button, listens
@@ -589,9 +1128,24 @@ function sendVoiceCommand(text) {
 // old per-utterance gating, so anything the mic picks up while wake word
 // mode is on gets sent to Neural -- turn the toggle off (or use the
 // push-to-talk mic button instead) in situations where that's not wanted.
+// True when a transcript is most likely Neural's own voice picked up by the
+// mic (speakers -> mic echo), not the user. Without this, a loud speaker
+// could make her interrupt herself, or even "hear" her own sentence as a
+// new command and answer it.
+function looksLikeOwnEcho(transcript) {
+  if (!replyTextForEcho) return false;
+  if (!isSpeaking && Date.now() - lastSpeechEndedAt > 1500) return false;
+  const words = (transcript.toLowerCase().match(/[a-z0-9']+/g) || []).filter((w) => w.length > 2);
+  if (words.length < 2) return false;
+  const said = new Set(replyTextForEcho.toLowerCase().match(/[a-z0-9']+/g) || []);
+  const overlap = words.filter((w) => said.has(w)).length / words.length;
+  return overlap >= 0.7;
+}
+
 function handleWakeTranscript(transcript) {
   const trimmed = transcript.trim();
   if (!trimmed) return;
+  if (looksLikeOwnEcho(trimmed)) return;
   const lower = trimmed.toLowerCase();
   const idx = lower.indexOf(wakePhrase);
   const command = idx !== -1 ? trimmed.slice(idx + wakePhrase.length).trim() : trimmed;
@@ -618,7 +1172,16 @@ function startContinuousListening() {
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
       const transcript = result[0].transcript.trim();
-      if (!bargedInThisUtterance && transcript.length >= 2 && (isSpeaking || expectingAudio)) {
+      // Cut her off the instant you start talking -- but only while she's
+      // actually SPEAKING, and only if it isn't her own voice echoing back.
+      // While she's merely thinking/working, a stray noise shouldn't cancel
+      // the work; your finished sentence still interrupts it (sendMessage
+      // supersedes the old turn) once the transcript is final.
+      if (
+        !bargedInThisUtterance && isSpeaking &&
+        (transcript.split(/\s+/).length >= 2 || transcript.length >= 6) &&
+        !looksLikeOwnEcho(transcript)
+      ) {
         bargedInThisUtterance = true;
         bargeIn();
         setState("listening", "LISTENING…");
@@ -686,11 +1249,11 @@ voiceToggle.addEventListener("click", () => {
 
 micBtn.addEventListener("click", () => {
   if (!SR || micBtn.classList.contains("recording")) return;
-  // Pressing the mic button is itself an unambiguous "let me talk"
-  // signal -- don't wait for a transcript to cut Neural off, do it the
-  // instant the button is pressed, same as the interim-result barge-in
-  // above does for hands-free wake-word listening.
-  bargeIn();
+  // Pressing the mic button is an unambiguous "let me talk" signal: stop
+  // her VOICE immediately. Work she's in the middle of is only superseded
+  // once you've actually said something (sendMessage handles that), so a
+  // mis-tap doesn't throw away a half-done task.
+  if (isSpeaking) bargeIn();
   const rec = new SR();
   rec.continuous = false;
   rec.interimResults = false;
@@ -720,6 +1283,7 @@ micBtn.addEventListener("click", () => {
 function classify(event) {
   if (event.type === "tts_error") return { cls: "tag-error", tag: "TTS" };
   if (event.type === "automation_run") return { cls: "tag-automation", tag: "AUTO" };
+  if (event.type === "background_job") return { cls: "tag-automation", tag: "JOB" };
   const tool = event.tool || "";
   if (tool === "Bash") return { cls: "tag-bash", tag: tool };
   if (tool === "Write" || tool === "Edit" || tool === "Read") return { cls: "tag-file", tag: tool };
@@ -748,7 +1312,7 @@ function renderActivity(event) {
   const { cls, tag } = classify(event);
   let detail = "";
   if (event.type === "tool_use") detail = summarizeInput(event.tool, event.input);
-  else if (event.type === "automation_run") detail = event.name + " — " + event.status;
+  else if (event.type === "automation_run" || event.type === "background_job") detail = event.name + " — " + event.status;
   else if (event.type === "tts_error") detail = event.message;
 
   const source = event.source && event.source !== "chat" ? event.source : "";
@@ -778,6 +1342,15 @@ function connectEvents() {
   eventsSocket.onmessage = (event) => {
     const data = JSON.parse(event.data);
     renderActivity(data);
+    updateAvatarActivity(data);
+    if (data.type === "background_job") {
+      if (data.status === "started") backgroundJobs.set(data.id, data.name);
+      else backgroundJobs.delete(data.id);
+      if (avatar && uiState === "idle") {
+        avatar.setActivity(null);
+        refreshIdleChip();
+      }
+    }
     if (data.type === "automation_run") loadAutomations();
   };
 }
@@ -1044,6 +1617,7 @@ if (kbOpenModalBtn) {
 /* ---------------- Mobile side drawer ---------------- */
 
 function openPanel() {
+  setOpsOpen(false);
   sideCol.classList.add("open");
   sideBackdrop.classList.add("show");
 }
@@ -1058,6 +1632,29 @@ if (panelToggle) {
   sideBackdrop.addEventListener("click", closePanel);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && sideCol.classList.contains("open")) closePanel();
+  });
+}
+
+/* ---------------- Operations slide-out ---------------- */
+
+function setOpsOpen(open) {
+  if (!opsPanel) return;
+  opsPanel.classList.toggle("open", open);
+  opsBackdrop.classList.toggle("show", open);
+  opsPanel.setAttribute("aria-hidden", String(!open));
+  opsToggle.setAttribute("aria-expanded", String(open));
+}
+
+if (opsToggle) {
+  opsToggle.addEventListener("click", () => {
+    const isOpen = opsPanel.classList.contains("open");
+    if (!isOpen) closePanel();
+    setOpsOpen(!isOpen);
+  });
+  opsClose.addEventListener("click", () => setOpsOpen(false));
+  opsBackdrop.addEventListener("click", () => setOpsOpen(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && opsPanel.classList.contains("open")) setOpsOpen(false);
   });
 }
 

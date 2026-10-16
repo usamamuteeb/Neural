@@ -10,6 +10,12 @@ google-auth-oauthlib>=1.2
 apscheduler>=3.10
 pywebpush>=2.0
 
+# backend/process_watchdog.py -- cross-platform process listing/killing,
+# used to reap orphaned ffmpeg/mcp-video/cap processes a wedged video
+# render/export/recording left running after Neural's own conversation
+# already timed out and recovered. See that module's docstring.
+psutil>=6.0
+
 # Technical Tutor mode's knowledge base layer (backend/knowledge_base.py)
 # -- fully local, no API key: fastembed runs a small ONNX embedding
 # model on-device (no torch), pypdf extracts text from PDFs, numpy does
@@ -25,3 +31,12 @@ numpy
 # single-column, ATS-safe .docx from structured data. No other project
 # code depends on this; only that skill's build_ats_resume.py script does.
 python-docx>=1.1
+
+# Social media / video link analysis (backend/media_analysis.py). yt-dlp
+# fetches captions/metadata/video from ~1800 sites -- keep it updated
+# (`pip install -U yt-dlp`), sites change often. faster-whisper transcribes
+# caption-less videos on-device (CPU is fine); its PyAV dependency also
+# extracts frames when ffmpeg isn't on PATH.
+yt-dlp
+faster-whisper
+# Optional, better free offline voice while edge-tts is down: pip install piper-tts

@@ -36,6 +36,15 @@ class EventBus:
             self._history = self._history[-self._max_history :]
         for q in list(self._subscribers):
             q.put_nowait(full)
+        # Persist a compact, redacted audit record independently of the live
+        # feed. Import lazily to keep the event bus usable during startup even
+        # if diagnostics storage is temporarily unavailable.
+        try:
+            from .observability import record_event
+
+            record_event(full)
+        except Exception:
+            pass
 
 
 bus = EventBus()

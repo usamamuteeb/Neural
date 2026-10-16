@@ -40,8 +40,10 @@ from claude_agent_sdk import (
     tool,
 )
 
-from . import config
-from .agent import new_client, wrap_for_automation
+from . import browser_efficiency, config, process_watchdog
+from .mood import extract_mood
+from .agent import new_client, wrap_for_automation  # noqa: F401 (new_client kept for callers)
+from .background import run_isolated
 from .events import bus
 
 logger = logging.getLogger("neural.automations")
@@ -313,36 +315,22 @@ async def run_automation(task_id: str) -> None:
         # prompt's "every morning at 8am..." phrasing describes a routine
         # that's ALREADY scheduled and running right now, not a new
         # scheduling request.
-        client = new_client(isolated=True)
-        await client.connect()
-        try:
-            await client.query(wrap_for_automation(task["prompt"]))
-            async for msg in client.receive_response():
-                # Only AssistantMessage/TextBlock is the model's own final
-                # answer. The previous version here summed getattr(block,
-                # "text", None) across every message type without checking
-                # what kind of block it was -- which, live, ended up
-                # concatenating unrelated tool/skill content (e.g. a loaded
-                # skill's own instructions) into "last_result" right along
-                # with (or instead of) the real answer.
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            result_text += block.text
-                        elif isinstance(block, ToolUseBlock):
-                            bus.publish(
-                                {
-                                    "type": "tool_use",
-                                    "tool": block.name,
-                                    "input": block.input,
-                                    "source": f"automation:{name}",
-                                }
-                            )
-        finally:
-            await client.disconnect()
+        # Shared with background jobs (background.py): an isolated client
+        # with a hard total limit, an idle limit, and cleanup of its own
+        # ffmpeg/Cap processes on timeout. Before this, a stuck tool call
+        # could hang an automation run -- and its processes -- forever.
+        result_text, run_error = await run_isolated(
+            wrap_for_automation(task["prompt"]),
+            source=f"automation:{name}",
+            max_seconds=config.AUTOMATION_MAX_SECONDS,
+            idle_seconds=config.AUTOMATION_IDLE_TIMEOUT_SECONDS,
+        )
+        if run_error:
+            error = run_error
     except Exception as exc:  # noqa: BLE001 -- surface any failure to the feed instead of crashing the scheduler
         error = str(exc)
 
+    result_text, result_mood = extract_mood(result_text)
     result_text = result_text.strip()
 
     tasks = _load()
@@ -377,7 +365,7 @@ async def run_automation(task_id: str) -> None:
     else:
         spoken = result_text or f'Your "{name}" automation just finished, but produced no output.'
     try:
-        await deliver_assistant_message(spoken, source=f"automation:{name}")
+        await deliver_assistant_message(spoken, source=f"automation:{name}", mood=None if error else result_mood)
     except Exception as exc:  # noqa: BLE001 -- delivery failing shouldn't crash the scheduler
         logger.error("Failed to deliver automation result to chat: %s", exc)
 
@@ -482,8 +470,56 @@ def start_scheduler() -> None:
 
     if changed:
         _save(tasks)
+
+    # Independent of any automation: periodically sweep for (and kill)
+    # Neural's own stray ffmpeg/mcp-video/cap processes left behind by a
+    # wedged video render/export/recording -- see
+    # backend/process_watchdog.py's module docstring for the bug this
+    # fixes (an orphaned process that outlives the chat turn that started
+    # it, since disconnecting the `claude` CLI subprocess doesn't reliably
+    # kill its own still-alive descendants). This is a plain scheduled
+    # job, not an LLM-driven automation -- deterministic, no tokens spent,
+    # runs whether or not anyone is using Neural right now.
+    def _reap_job() -> None:
+        killed = process_watchdog.reap_stale_render_processes()
+        for item in killed:
+            bus.publish({"type": "watchdog_kill", "mode": "scheduled", **item})
+
+    scheduler.add_job(
+        _reap_job, "interval", seconds=config.REAP_INTERVAL_SECONDS,
+        id="reap_stale_render_processes", replace_existing=True,
+    )
+
     if not scheduler.running:
         scheduler.start()
+
+    # Also run one sweep immediately at every startup (not just on the
+    # recurring interval above) -- so restarting Neural to pick up a fix
+    # like this one, or just a normal restart after a stuck render was
+    # left running overnight, cleans up anything already stale right
+    # away instead of waiting up to REAP_INTERVAL_SECONDS for the first
+    # tick.
+    _reap_job()
+
+    # Housekeeping: .playwright-mcp collects a page-*.yml snapshot for every
+    # browser action (it had reached ~1000 files / 49MB). Snapshots and
+    # console logs older than a couple of days are useless; anything else in
+    # that folder (PDFs, screenshots) is left alone. See browser_efficiency.py.
+    def _housekeeping_job() -> None:
+        browser_efficiency.prune_artifacts()
+        # Link-analysis cache (downloaded clips, frames, transcripts) --
+        # kept a week so follow-up questions are instant, then removed.
+        from . import media_analysis
+        media_analysis.prune_old()
+
+    scheduler.add_job(
+        _housekeeping_job, "interval", hours=6,
+        id="prune_browser_artifacts", replace_existing=True,
+    )
+    try:
+        _housekeeping_job()
+    except Exception as exc:  # noqa: BLE001 -- housekeeping must never block startup
+        logger.error("Browser artifact pruning failed: %s", exc)
 
     for task_id in to_catch_up:
         name = tasks.get(task_id, {}).get("name", "?")
